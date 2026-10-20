@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static:
+    name: Lint + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: for f in erisbox.sh install.sh tests/*.sh; do bash -n "$f"; done
+      - name: ShellCheck
+        run: shellcheck -S warning erisbox.sh install.sh tests/*.sh
+      - name: Unit tests (+ nftables syntax check)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables
+          sudo bash tests/unit.sh
+
+  integration:
+    name: Integration on ${{ matrix.host }}
+    needs: static
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-22.04
+            os_a: ubuntu-22.04
+            os_b: debian-12
+          - host: ubuntu-24.04
+            os_a: ubuntu-24.04
+            os_b: debian-13
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, create machines and test everything
+        run: sudo bash tests/integration.sh ${{ matrix.os_a }} ${{ matrix.os_b }}
