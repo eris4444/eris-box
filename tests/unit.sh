@@ -157,10 +157,14 @@ eq "res disk given" "$R_DISK_GIVEN" $((5 * 1073741824))
 res_compute alpha
 eq "res without alpha" "$R_COUNT $R_CPU_GIVEN" "1 0.5"
 yes res_show
-T=$((T + 1)); res_show | grep -q "CPU cores" || { echo "FAIL: res_show has no CPU line"; FAILS=$((FAILS + 1)); }
+# (capture first: with pipefail, "grep -q" closing the pipe early would fail the producer)
+OUT="$(res_show)"
+T=$((T + 1)); grep -q "CPU cores" <<<"$OUT" || { echo "FAIL: res_show has no CPU line"; FAILS=$((FAILS + 1)); }
 res_compute; R_CPUS=1
-T=$((T + 1)); oversell_warn 0.5 100M 0 2>&1 | grep -q "CPU oversold" || { echo "FAIL: no CPU oversell warning"; FAILS=$((FAILS + 1)); }
-T=$((T + 1)); oversell_warn 0.1 1M 0 2>&1 | grep -q "CPU oversold" && { echo "FAIL: false CPU oversell warning"; FAILS=$((FAILS + 1)); }
+OUT="$(oversell_warn 0.5 100M 0 2>&1)"
+T=$((T + 1)); grep -q "CPU oversold" <<<"$OUT" || { echo "FAIL: no CPU oversell warning"; FAILS=$((FAILS + 1)); }
+OUT="$(oversell_warn 0.1 1M 0 2>&1)"
+T=$((T + 1)); grep -q "CPU oversold" <<<"$OUT" && { echo "FAIL: false CPU oversell warning"; FAILS=$((FAILS + 1)); }
 yes cpu_ok 0.2
 no cpu_ok 0
 no cpu_ok abc
