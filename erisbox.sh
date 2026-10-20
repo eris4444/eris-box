@@ -2553,7 +2553,6 @@ API_TOKENS=$ETC_DIR/api-tokens
 API_DIR=$ETC_DIR/api
 API_PY=$LIB_DIR/api.py
 A_KEYS="PORT TLS CERT KEY ALLOW"
-# shellcheck disable=SC2034  # A_KEY is written by a_save (indirectly) and read by api.py
 a_load() { A_PORT=9443; A_TLS=1; A_CERT="$API_DIR/cert.pem"; A_KEY="$API_DIR/key.pem"; A_ALLOW=""; kv_load "$API_CONF" A_; }
 # shellcheck disable=SC2086
 a_save() { kv_save "$API_CONF" A_ $A_KEYS; }
@@ -2670,7 +2669,8 @@ api_status() {
   printf '  allow  : %s\n' "${A_ALLOW:-from anywhere (a token is always required)}"
   printf '  tokens : %s\n' "$(cut -d: -f1 "$API_TOKENS" 2>/dev/null | paste -sd' ' -)"
   if [ "$A_TLS" = 1 ] && pin="$(api_pin)"; then
-    printf '  TLS    : self-signed or own certificate - pin it in your bot:\n'
+    printf '  cert   : %s (key %s)\n' "$A_CERT" "$A_KEY"
+    printf '  TLS    : pin this certificate in your bot:\n'
     printf '           %s\n' "$pin"
     printf '  test   : curl -k --pinnedpubkey "%s" -H "Authorization: Bearer TOKEN" %s/plans\n' "$pin" "$(api_url)"
   else
