@@ -52,8 +52,12 @@ yes valid_domain example.com
 yes valid_domain sub.example.co.uk
 yes valid_domain site1.test
 for v in -bad.com "ex ample.com" com Example.com; do no valid_domain "$v"; done
-yes valid_password Test-Pass-1234
-for v in short "has space" "quote'x" "colon:x" 'dollar$x'; do no valid_password "$v"; done
+for v in Test-Pass-1234 x "has space" "quote'x" 'dq"x' "colon:x" 'dollar$x' 'back\slash' 'رمز عبور ۱۲۳' " lead and trail "; do
+  yes valid_password "$v"
+done
+no valid_password ""
+no valid_password $'two\nlines'
+no valid_password "$(printf 'a%.0s' {1..257})"
 yes valid_sshkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKey user@host"
 no valid_sshkey "not a key"
 yes valid_url http://archive.ubuntu.com/ubuntu
@@ -94,7 +98,7 @@ eq "g_base" "$(g_base)" $((1000000 + 5 * 65536))
 # conf files round trip
 TMPD="$(mktemp -d)"
 CONF_FILE="$TMPD/erisbox.conf"; GUEST_DIR="$TMPD/guests"; DOMAIN_FILE="$TMPD/domains"
-TRAFFIC_DIR="$TMPD/traffic"; LOG_DIR="$TMPD/logs"; mkdir -p "$GUEST_DIR"
+TRAFFIC_DIR="$TMPD/traffic"; LOG_DIR="$TMPD/logs"; VAR_DIR="$TMPD"; mkdir -p "$GUEST_DIR"
 s_defaults; S_DNS="9.9.9.9 1.0.0.1"; S_PUBLIC_IP=203.0.113.9; s_save
 s_defaults; s_load
 eq "settings round trip DNS" "$S_DNS" "9.9.9.9 1.0.0.1"
@@ -109,6 +113,26 @@ G_SSH_PORT=2201; G_PORTS="both:20001-20010:20001 tcp:8080-8080:80"; G_IPS="198.5
 g_reset; G_NAME=beta; G_ID=2; G_UIDBASE=1131072; G_OS=debian-12; G_CPU=0.5; G_RAM=300M; G_SWAP=0; G_DISK=3G
 G_SSH_PORT=2202; G_PORTS=""; G_IPS="192.0.2.10,192.0.2.10,lo,192.0.2.1,0;198.51.100.8,198.51.100.8,eth0,,1"; g_save
 eq "g_names" "$(g_names | paste -sd, -)" "alpha,beta"
+
+# root password with any characters: stored base64, never in plain text
+WEIRD=$'p a$s:w"o\'rd \\ ü رمز'
+g_load alpha; G_PASSWORD="$WEIRD"; g_save
+T=$((T + 1)); grep -q "^PASSWORD64='" "$GUEST_DIR/alpha.conf" && ! grep -q "^PASSWORD=" "$GUEST_DIR/alpha.conf" \
+  || { echo "FAIL: password not stored as PASSWORD64"; FAILS=$((FAILS + 1)); }
+g_load alpha; eq "password round trip" "$G_PASSWORD" "$WEIRD"
+printf "PASSWORD='old-plain-pass'\nID='9'\n" > "$GUEST_DIR/legacy.conf"
+g_load legacy; eq "1.0 conf with a plain PASSWORD still loads" "$G_PASSWORD" old-plain-pass
+rm -f "$GUEST_DIR/legacy.conf"
+T=$((T + 1)); [ "$(pw_hash "$WEIRD" | cut -c1-3)" = '$6$' ] || { echo "FAIL: pw_hash is not SHA-512 crypt"; FAILS=$((FAILS + 1)); }
+
+# login banner: valid sh, shows name + OS, never resource numbers
+banner_script > "$TMPD/banner.sh"
+yes sh -n "$TMPD/banner.sh"
+BANNER_OUT="$(sh "$TMPD/banner.sh" 2>&1)"
+T=$((T + 1)); grep -q "System" <<<"$BANNER_OUT" || { echo "FAIL: banner has no System line"; FAILS=$((FAILS + 1)); }
+T=$((T + 1)); grep -qiwE 'ram|swap|disk|cpu|memory' "$TMPD/banner.sh" && { echo "FAIL: banner mentions resources"; FAILS=$((FAILS + 1)); }
+T=$((T + 1)); [ "$(hostname | tr '[:lower:]' '[:upper:]' | cut -c1)" = "$(grep -o '◆.*' <<<"$BANNER_OUT" | sed 's/\x1b\[[0-9;]*m//g; s/◆ *//' | cut -c1)" ] \
+  || { echo "FAIL: banner title is not the machine name"; FAILS=$((FAILS + 1)); }
 eq "alloc_id" "$(alloc_id)" 3
 eq "alloc_base keeps a free preferred base" "$(alloc_base $((1000000 + 7 * 65536)))" $((1000000 + 7 * 65536))
 eq "alloc_base skips a used base" "$(alloc_base 1065536)" $((1000000 + 3 * 65536))
@@ -122,6 +146,27 @@ no port_free udp 20005 20005
 yes port_free udp 8080 8080
 no port_free tcp 8080 8080
 eq "alloc_ssh_port skips used" "$(S_SSH_PORT_START=2201; alloc_ssh_port)" "$( p=2203; while ss -Hlnt "sport = :$p" 2>/dev/null | grep -q .; do p=$((p + 1)); done; echo $p)"
+
+# server resources: totals vs what the machines got
+res_compute
+eq "res count" "$R_COUNT" 2
+eq "res cpu given" "$R_CPU_GIVEN" 0.7
+eq "res ram given" "$R_MEM_GIVEN" $((500 * 1048576))
+eq "res swap given" "$R_SWAP_GIVEN" 1073741824
+eq "res disk given" "$R_DISK_GIVEN" $((5 * 1073741824))
+res_compute alpha
+eq "res without alpha" "$R_COUNT $R_CPU_GIVEN" "1 0.5"
+yes res_show
+T=$((T + 1)); res_show | grep -q "CPU cores" || { echo "FAIL: res_show has no CPU line"; FAILS=$((FAILS + 1)); }
+res_compute; R_CPUS=1
+T=$((T + 1)); oversell_warn 0.5 100M 0 2>&1 | grep -q "CPU oversold" || { echo "FAIL: no CPU oversell warning"; FAILS=$((FAILS + 1)); }
+T=$((T + 1)); oversell_warn 0.1 1M 0 2>&1 | grep -q "CPU oversold" && { echo "FAIL: false CPU oversell warning"; FAILS=$((FAILS + 1)); }
+yes cpu_ok 0.2
+no cpu_ok 0
+no cpu_ok abc
+yes size_ok 200M 64M
+no size_ok 10M 64M
+no size_ok lots 64M
 
 RULES="$(S_PROXY_ENABLED=1; nft_render eth0)"
 for want in 'tcp dport 2201 dnat to 10.88.0.11:22' 'tcp dport 20001-20010 dnat to 10.88.0.11' \

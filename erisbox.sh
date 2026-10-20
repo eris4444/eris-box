@@ -11,7 +11,7 @@
 #
 #  Run "erisbox" for the menu or "erisbox help" for the command line.
 
-SCRIPT_VER="1.0.0"
+SCRIPT_VER="1.1.0"
 REPO="eris4444/eris-box"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
@@ -138,7 +138,9 @@ valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ $((10#$1)) -ge 1 ] && [ $((10#$1)
 valid_int() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
 valid_num() { [[ "$1" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]]; }
 valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$(date -d "$1" +%F 2>/dev/null)" = "$1" ]; }
-valid_password() { [[ "$1" =~ ^[A-Za-z0-9._@%+=,!#^*-]{6,64}$ ]]; }
+# any characters (spaces, quotes, : $ ...), just not empty, no line break, at most 256 bytes
+valid_password() { [ -n "$1" ] && [[ "$1" != *$'\n'* ]] && [[ "$1" != *$'\r'* ]] && [ "${#1}" -le 256 ]; }
+PW_RULE="the password can be anything except empty or a line break (max 256 bytes)"
 valid_url() { [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; }
 valid_iface() { [[ "$1" =~ ^[A-Za-z0-9_.:@-]{1,15}$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
 valid_hostport() {
@@ -249,22 +251,32 @@ s_load() { s_defaults; kv_load "$CONF_FILE" S_; }
 s_save() { kv_save "$CONF_FILE" S_ $S_KEYS; }
 
 # --------------------------------------------------------------- machines ---
-G_KEYS="ID UIDBASE OS CPU RAM SWAP DISK PIDS IO_MBPS IO_IOPS TUN SPEED TRAFFIC_GB RESET_DAY RESET_TAG EXPIRE SSH_PORT PORTS IPS PASSWORD NOTE AUTOSTART CREATED"
+# the root password is kept base64-encoded (PASSWORD64) so it may contain any character
+G_KEYS="ID UIDBASE OS CPU RAM SWAP DISK PIDS IO_MBPS IO_IOPS TUN SPEED TRAFFIC_GB RESET_DAY RESET_TAG EXPIRE SSH_PORT PORTS IPS PASSWORD64 NOTE AUTOSTART CREATED"
 g_reset() {
   G_NAME=""; G_ID=""; G_UIDBASE=""; G_OS=""; G_CPU=""; G_RAM=""; G_SWAP=""; G_DISK=""; G_PIDS=512
   G_IO_MBPS=0; G_IO_IOPS=0; G_TUN=0; G_SPEED=0; G_TRAFFIC_GB=0; G_RESET_DAY=0; G_RESET_TAG=""
-  G_EXPIRE=""; G_SSH_PORT=""; G_PORTS=""; G_IPS=""; G_PASSWORD=""; G_NOTE=""; G_AUTOSTART=1; G_CREATED=""
+  G_EXPIRE=""; G_SSH_PORT=""; G_PORTS=""; G_IPS=""; G_PASSWORD=""; G_PASSWORD64=""; G_NOTE=""; G_AUTOSTART=1; G_CREATED=""
 }
 g_conf() { printf '%s/%s.conf' "$GUEST_DIR" "$1"; }
 g_exists() { valid_name "$1" && [ -f "$(g_conf "$1")" ]; }
+g_pw_decode() { # PASSWORD64 -> G_PASSWORD (files from 1.0.x keep a plain PASSWORD='...')
+  if [ -n "$G_PASSWORD64" ]; then G_PASSWORD="$(printf '%s' "$G_PASSWORD64" | base64 -d 2>/dev/null)"; fi
+  return 0
+}
 g_load() {
   g_exists "$1" || die "machine '$1' not found (see: erisbox list)"
   g_reset
   kv_load "$(g_conf "$1")" G_
+  g_pw_decode
   G_NAME="$1"
 }
 # shellcheck disable=SC2086
-g_save() { kv_save "$(g_conf "$G_NAME")" G_ $G_KEYS; }
+g_save() {
+  G_PASSWORD64="$(printf '%s' "$G_PASSWORD" | base64 -w0)"
+  kv_save "$(g_conf "$G_NAME")" G_ $G_KEYS
+}
+pw_hash() { printf '%s' "$1" | openssl passwd -6 -stdin; }   # SHA-512 crypt
 g_names() {
   local f
   for f in "$GUEST_DIR"/*.conf; do
@@ -579,7 +591,8 @@ refresh_all() { # after an update: rewrite helpers + LXC configs, re-apply rules
   systemctl enable --now erisbox-tick.timer >/dev/null 2>&1
   take_lock
   local n
-  for n in $(g_names); do g_load "$n"; lxc_write_config; done
+  for n in $(g_names); do g_load "$n"; g_save; lxc_write_config; guest_banner_live; done
+  G_NAME=""
   net_apply
 }
 
@@ -751,14 +764,14 @@ guest_setup_files() {
   printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$G_NAME" | gwrite etc/hosts 644
   for t in $S_DNS; do echo "nameserver $t"; done | gwrite etc/resolv.conf 644
   printf '%s\n' "$(tr -d -- '-\n' </proc/sys/kernel/random/uuid)" | gwrite etc/machine-id 444
-  motd_text | gwrite etc/motd 644
+  guest_banner_fresh
   for t in rsa ecdsa ed25519; do
     rm -f "$m/etc/ssh/ssh_host_${t}_key" "$m/etc/ssh/ssh_host_${t}_key.pub"
     ssh-keygen -q -t "$t" -N '' -C "root@$G_NAME" -f "$m/etc/ssh/ssh_host_${t}_key" </dev/null >/dev/null \
       || { err "ssh-keygen failed"; return 1; }
     chown "$b:$b" "$m/etc/ssh/ssh_host_${t}_key" "$m/etc/ssh/ssh_host_${t}_key.pub"
   done
-  hash="$(printf '%s' "$G_PASSWORD" | openssl passwd -6 -stdin)" || { err "openssl passwd failed"; return 1; }
+  hash="$(pw_hash "$G_PASSWORD")" && [ -n "$hash" ] || { err "openssl passwd failed"; return 1; }
   days=$(( $(date +%s) / 86400 ))
   tmp="$(mktemp)"
   awk -F: -v OFS=: -v h="$hash" -v d="$days" '$1=="root"{$2=h; $3=d} {print}' "$m/etc/shadow" > "$tmp" \
@@ -771,19 +784,66 @@ guest_setup_files() {
   return 0
 }
 
-# login message with the machine's plan ("free" inside shows 0 swap with Ubuntu's lxcfs 5.0)
-motd_text() {
-  printf '\n  Welcome to %s (an Eris Box machine)\n\n' "$G_NAME"
-  printf '  Your plan : CPU %s core | RAM %s | swap %s | disk %s | max %s processes\n' "$G_CPU" "$G_RAM" "$G_SWAP" "$G_DISK" "$G_PIDS"
-  [ "${G_SPEED:-0}" != 0 ] && printf '  Speed     : %s Mbit/s\n' "$G_SPEED"
-  [ "${G_TRAFFIC_GB:-0}" != 0 ] && printf '  Traffic   : %s GB per month\n' "$G_TRAFFIC_GB"
-  [ -n "$G_EXPIRE" ] && printf '  Valid until %s\n' "$G_EXPIRE"
-  printf '  (free -h may show 0 swap here - your swap limit still applies)\n\n'
+# Colourful login banner shown inside the machine (pam_motd runs /etc/update-motd.d at SSH login).
+# Only the machine's name, OS, uptime and date - never its RAM / CPU / disk.
+BANNER_VER=2
+banner_script() {
+  cat <<'EOF'
+#!/bin/sh
+# Eris Box welcome banner - shown at SSH login
+. /etc/os-release 2>/dev/null
+name="$(hostname 2>/dev/null)"
+os="${PRETTY_NAME:-Linux}"
+up="$(uptime -p 2>/dev/null | sed 's/^up //')"
+now="$(date '+%A %d %B %Y  %H:%M %Z')"
+title="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | sed 's/./& /g; s/ $//')"
+e="$(printf '\033')"
+rule() {
+  printf '  '
+  for c in 201 200 199 198 163 164 129 128 93 92 57 63 69 75 81 87; do printf '%s[38;5;%sm━━━' "$e" "$c"; done
+  printf '%s[0m\n' "$e"
 }
-guest_motd_update() { # refresh /etc/motd inside a running machine (best effort)
+echo
+rule
+printf '   %s[1;38;5;213m◆%s[0m  %s[1;38;5;159m%s%s[0m\n' "$e" "$e" "$e" "$title" "$e"
+rule
+printf '   %s[38;5;244mSystem %s[0m %s[1;38;5;120m%s%s[0m\n' "$e" "$e" "$e" "$os" "$e"
+[ -n "$up" ] && printf '   %s[38;5;244mUptime %s[0m %s[38;5;222m%s%s[0m\n' "$e" "$e" "$e" "$up" "$e"
+printf '   %s[38;5;244mToday  %s[0m %s[38;5;183m%s%s[0m\n' "$e" "$e" "$e" "$now" "$e"
+echo
+EOF
+}
+# fresh disk: install the banner and silence the distro's own login messages
+guest_banner_fresh() {
+  local m f; m="$(g_mnt)"
+  if [ ! -d "$m/etc/update-motd.d" ]; then
+    mkdir "$m/etc/update-motd.d" && chown "$(g_base):$(g_base)" "$m/etc/update-motd.d"
+  fi
+  for f in "$m"/etc/update-motd.d/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    # never follow a symlink from the host: remove it instead
+    if [ -L "$f" ]; then rm -f "$f"; else chmod a-x "$f"; fi
+  done
+  banner_script | gwrite etc/update-motd.d/00-erisbox 755
+  : | gwrite etc/motd 644
+  [ -e "$m/etc/legal" ] && { : | gwrite etc/legal 644; }
+  mkdir -p "$VAR_DIR/banner"; echo "$BANNER_VER" > "$VAR_DIR/banner/$G_NAME"
+}
+# running machine (made by an older version): same thing from inside the machine
+guest_banner_live() {
+  [ "$(cat "$VAR_DIR/banner/$G_NAME" 2>/dev/null)" = "$BANNER_VER" ] && return 0
   g_running "$G_NAME" || return 0
-  motd_text | guest_exec "$G_NAME" sh -c 'cat > /etc/motd' >/dev/null 2>&1
-  return 0
+  banner_script | guest_exec "$G_NAME" sh -c '
+    mkdir -p /etc/update-motd.d && cat > /etc/update-motd.d/00-erisbox.new || exit 1
+    for f in /etc/update-motd.d/*; do
+      case "$f" in */00-erisbox*) continue ;; esac
+      if [ -L "$f" ]; then rm -f "$f"; elif [ -e "$f" ]; then chmod a-x "$f"; fi
+    done
+    chmod 755 /etc/update-motd.d/00-erisbox.new && mv -f /etc/update-motd.d/00-erisbox.new /etc/update-motd.d/00-erisbox
+    grep -qs "an Eris Box machine" /etc/motd && : > /etc/motd
+    [ -f /etc/legal ] && : > /etc/legal
+    exit 0' >/dev/null 2>&1 || return 0
+  mkdir -p "$VAR_DIR/banner"; echo "$BANNER_VER" > "$VAR_DIR/banner/$G_NAME"
 }
 
 guest_cleanup_failed() {
@@ -908,6 +968,7 @@ guest_start() {
   fi
   lxc-wait -n "$n" -s RUNNING -t 30 >/dev/null 2>&1 || { err "$n did not reach RUNNING"; return 1; }
   tc_apply
+  guest_banner_live   # machines made by Eris Box 1.0 get the new login banner once
   log "started $n"
   ok "$n is running"
 }
@@ -1699,9 +1760,10 @@ alloc_base() { # [preferred]
 }
 
 create_wizard() { # fills F[] and W_NAME
-  local v i
+  local v i ddef dmax
   W_NAME=""
   printf '\n%sCreate a new machine%s  (press Enter to accept the value in [brackets])\n\n' "$C_BD" "$C_0"
+  res_compute; res_show; echo
   while :; do
     ask W_NAME "Name (a-z, 0-9 and -)" ""
     if valid_name "$W_NAME" && ! g_exists "$W_NAME"; then break; fi
@@ -1712,22 +1774,50 @@ create_wizard() { # fills F[] and W_NAME
   ask v "OS (number or name)" "$S_DEF_OS"
   if valid_int "$v"; then v="$(echo "$OS_LIST" | awk -v i="$v" '{print $i}')"; fi
   F[os]="${v:-$S_DEF_OS}"
-  ask v "CPU cores (0.2 = 20% of one core)" "$S_DEF_CPU"; F[cpu]="$v"
-  ask v "RAM" "$S_DEF_RAM"; F[ram]="$v"
-  ask v "Swap" "$S_DEF_SWAP"; F[swap]="$v"
-  ask v "Disk" "$S_DEF_DISK"; F[disk]="$v"
+  while :; do
+    ask v "CPU cores - server has $R_CPUS, free $R_CPU_LEFT (0.2 = 20% of one core)" "$S_DEF_CPU"
+    cpu_ok "$v" && break; err "use a number between 0.01 and $R_CPUS"
+  done; F[cpu]="$v"
+  while :; do
+    ask v "RAM - free $(human "$(( R_MEM_LEFT > 0 ? R_MEM_LEFT : 0 ))") of $(human "$R_MEM")" "$S_DEF_RAM"
+    size_ok "$v" 64M && break; err "use a size like 200M or 1G (at least 64M)"
+  done; F[ram]="$v"
+  while :; do
+    ask v "Swap - free $(human "$(( R_SWAP_LEFT > 0 ? R_SWAP_LEFT : 0 ))") of $(human "$R_SWAP")" "$S_DEF_SWAP"
+    size_ok "$v" 0 && break; err "use a size like 512M or 1G (0 = none)"
+  done; F[swap]="$v"
+  # suggest a disk that really fits (keep 512M for the server)
+  ddef="$S_DEF_DISK"; dmax=$(( (R_DFREE - 536870912) / 1073741824 ))
+  if [ "$(to_bytes "$ddef")" -gt $((R_DFREE - 536870912)) ] && [ "$dmax" -ge 1 ]; then ddef="${dmax}G"; fi
+  while :; do
+    ask v "Disk - $(human "$R_DFREE") really free on the server" "$ddef"
+    if size_ok "$v" 1G; then
+      [ "$(to_bytes "$v")" -lt $((R_DFREE - 314572800)) ] && break
+      err "not enough free disk for $v"
+    else
+      err "use a size like 2G (at least 1G)"
+    fi
+  done; F[disk]="$v"
+  oversell_warn "${F[cpu]}" "${F[ram]}" "${F[swap]}"
   ask v "SSH port on this server's IP" auto; F[ssh-port]="$v"
   ask v "How many extra ports to forward (0 = none)" "$S_PORTS_PER_GUEST"; F[ports]="$v"
   ask v "Speed limit in Mbit/s (0 = no limit)" 0; F[speed]="$v"
   ask v "Monthly traffic limit in GB (0 = no limit)" 0; F[traffic]="$v"
   ask v "Expires after how many days (0 = never)" 0; F[expire]="$v"
-  ask v "Root password (empty = random)" ""; [ -n "$v" ] && F[password]="$v"
+  while :; do
+    ask v "Root password - anything you like (empty = random)" ""
+    [ -z "$v" ] && break
+    valid_password "$v" && { F[password]="$v"; break; }
+    err "$PW_RULE"
+  done
+  printf '\n  %s%s%s: %s | CPU %s | RAM %s | swap %s | disk %s\n' "$C_BD" "$W_NAME" "$C_0" "$(os_label "${F[os]}")" "${F[cpu]}" "${F[ram]^^}" "${F[swap]^^}" "${F[disk]^^}"
   confirm "Create machine '$W_NAME' now?" y
 }
 
 cmd_create() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local name="${POS[0]:-}" os cpu ram swap disk pids speed traffic expire rday pw key tun iom ioi sshp ports first cnt free need allr allc x
+  local name="${POS[0]:-}" os cpu ram swap disk pids speed traffic expire rday pw key tun iom ioi sshp ports first free need allr allc
+  W_NAME=""
   if [ -z "$name" ]; then
     interactive || die "usage: erisbox create NAME [options] (see: erisbox help)"
     create_wizard || die "cancelled"
@@ -1747,7 +1837,7 @@ cmd_create() {
   [ "$rday" -gt 28 ] && rday=28; [ "$rday" -lt 1 ] && rday=1
   expire="$(expire_value "$(flag expire "")")" || die "--expire takes a number of days or a date like 2026-12-31"
   pw="$(flag password "")"; [ -n "$pw" ] || pw="$(gen_password)"
-  valid_password "$pw" || die "password: 6-64 characters from A-Z a-z 0-9 . _ @ % + = , ! # ^ * -"
+  valid_password "$pw" || die "$PW_RULE"
   key="$(flag ssh-key "")"; [ -z "$key" ] || valid_sshkey "$key" || die "--ssh-key does not look like an SSH public key"
   case "$(flag tun off)" in on|1|yes) tun=1 ;; off|0|no) tun=0 ;; *) die "--tun on|off" ;; esac
   iom="$(flag io-mbps 0)"; ioi="$(flag io-iops 0)"
@@ -1789,11 +1879,8 @@ cmd_create() {
   [ -s "$CACHE_DIR/$os.tar.zst" ] || need=$((need + 1073741824))
   free="$(disk_free "$VAR_DIR")"
   [ "$free" -gt "$need" ] || die "not enough free disk: need about $(human "$need"), have $(human "$free")"
-  cnt=0; for x in $(used_field RAM); do cnt=$((cnt + $(to_bytes "$x"))); done
-  cnt=$((cnt + $(to_bytes "$ram")))
-  if [ "$cnt" -gt $(( $(host_mem) - 268435456 )) ]; then
-    warn "all machines together get $(human "$cnt") RAM but this server has $(human "$(host_mem)") (overselling - fine while they are not all busy)"
-  fi
+  # the wizard already showed these warnings
+  [ -n "${W_NAME:-}" ] || { res_compute; oversell_warn "$cpu" "$ram" "$swap"; }
 
   g_reset
   G_NAME="$name"; G_ID="$(alloc_id)" || die "no free machine slots (max $MAX_ID)"
@@ -1939,13 +2026,13 @@ cmd_set() {
   if has_flag autostart; then case "$(flag autostart)" in on|1|yes) G_AUTOSTART=1 ;; off|0|no) G_AUTOSTART=0 ;; *) die "--autostart on|off" ;; esac; changed=1; fi
   if has_flag tun; then case "$(flag tun)" in on|1|yes) v=1 ;; off|0|no) v=0 ;; *) die "--tun on|off" ;; esac; [ "$v" != "$G_TUN" ] && restart=1; G_TUN="$v"; changed=1; fi
   [ "$changed" = 1 ] || die "nothing to change (see: erisbox help)"
+  if has_flag cpu || has_flag ram || has_flag swap; then res_compute "$name"; oversell_warn "$G_CPU" "$G_RAM" "$G_SWAP"; fi
   g_save
   lxc_write_config
   apply_live_limits
   if [ -n "$G_NOTE" ]; then enforce_note
   elif [ "$start" = 1 ] && [ "$G_AUTOSTART" = 1 ]; then guest_start
   fi
-  guest_motd_update
   log "set $name $*"
   ok "updated $name"
   [ "$restart" = 1 ] && g_running "$name" && warn "restart $name to apply the TUN change: erisbox restart $name"
@@ -1973,7 +2060,6 @@ cmd_renew() {
   g_save; lxc_write_config
   [ -z "$G_NOTE" ] && [ "$G_AUTOSTART" = 1 ] && guest_start
   tc_apply
-  guest_motd_update
   log "renew $name until $G_EXPIRE"
   ok "$name is valid until $G_EXPIRE"
 }
@@ -1997,14 +2083,17 @@ cmd_traffic() {
 
 cmd_passwd() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local name="${POS[0]:-}" pw="${POS[1]:-}"
+  local name="${POS[0]:-}" pw hash
+  pw="$(flag password "${POS[1]:-}")"
   g_load "$name"
-  if [ -z "$pw" ]; then ask pw "New root password for $name (empty = random)" ""; fi
+  if [ -z "$pw" ]; then ask pw "New root password for $name (anything you like, empty = random)" ""; fi
   [ -n "$pw" ] || pw="$(gen_password)"
-  valid_password "$pw" || die "password: 6-64 characters from A-Z a-z 0-9 . _ @ % + = , ! # ^ * -"
+  valid_password "$pw" || die "$PW_RULE"
   take_lock; g_load "$name"
   g_running "$name" || die "start the machine first: erisbox start $name"
-  printf 'root:%s\n' "$pw" | guest_exec "$name" chpasswd || die "could not change the password"
+  # set a ready hash: no shell quoting issues and no password-strength rules inside the machine
+  hash="$(pw_hash "$pw")" && [ -n "$hash" ] || die "could not hash the password"
+  printf 'root:%s\n' "$hash" | guest_exec "$name" chpasswd -e || die "could not change the password"
   G_PASSWORD="$pw"; g_save
   log "passwd $name"
   ok "new root password of $name: $pw"
@@ -2047,7 +2136,7 @@ cmd_reinstall() {
   g_load "$name"
   os="$(flag os "$G_OS")"; os_resolve "$os" || die "unknown OS '$os' (choose: $OS_LIST)"
   pw="$(flag password "")"; [ -n "$pw" ] || pw="$(gen_password)"
-  valid_password "$pw" || die "invalid password"
+  valid_password "$pw" || die "$PW_RULE"
   key="$(flag ssh-key "")"; [ -z "$key" ] || valid_sshkey "$key" || die "invalid --ssh-key"
   confirm "ALL files on $name will be erased and $(os_label "$os") installed fresh. Continue?" n || die "cancelled"
   take_lock; g_load "$name"
@@ -2131,7 +2220,7 @@ cmd_restore() {
   if ! valid_name "$name" || g_exists "$name" || [ -e "$LXC_DIR/$name" ]; then
     rm -rf "$tmpd"; die "a machine called '$name' already exists here - give a new name: erisbox restore $file NEWNAME"
   fi
-  g_reset; kv_load "$conf" G_; G_NAME="$name"
+  g_reset; kv_load "$conf" G_; g_pw_decode; G_NAME="$name"
   if ! os_resolve "$G_OS" || ! valid_num "$G_CPU" || ! to_bytes "$G_RAM" >/dev/null || ! to_bytes "$G_SWAP" >/dev/null \
      || ! to_bytes "$G_DISK" >/dev/null || ! valid_int "$G_PIDS" || ! valid_password "$G_PASSWORD"; then
     rm -rf "$tmpd"; die "the settings inside this backup are damaged"
@@ -2202,7 +2291,7 @@ cmd_delete() {
   guest_umount
   rm -f "$(g_img)"; rmdir "$(g_mnt)" 2>/dev/null
   if [ -f "$LXC_DIR/$name/config" ] && grep -q "^$LXC_MARK" "$LXC_DIR/$name/config"; then rm -rf "${LXC_DIR:?}/$name"; fi
-  rm -f "$TRAFFIC_DIR/$name" "$TRAFFIC_DIR/$name.lock" "$LOG_DIR/$name.log"
+  rm -f "$TRAFFIC_DIR/$name" "$TRAFFIC_DIR/$name.lock" "$LOG_DIR/$name.log" "$VAR_DIR/banner/$name"
   if [ -s "$DOMAIN_FILE" ] && awk -v n="$name" '$2==n {f=1} END{exit !f}' "$DOMAIN_FILE"; then
     tmp="$(mktemp)"; awk -v n="$name" '$2!=n' "$DOMAIN_FILE" > "$tmp" && cat "$tmp" > "$DOMAIN_FILE"; rm -f "$tmp"
     proxy_render
@@ -2214,18 +2303,75 @@ cmd_delete() {
   ok "machine $name deleted"
 }
 
+# ============================================================= RESOURCES ===
+HOST_RESERVE=268435456   # RAM kept for the server itself (256M)
+# totals of the server and what the machines already got (optionally leaving one machine out)
+res_compute() {
+  local n c
+  R_CPUS="$(host_cpus)"; R_MEM="$(host_mem)"; R_SWAP="$(host_swap)"
+  read -r R_DTOT R_DUSED R_DFREE < <(df -B1 --output=size,used,avail "$VAR_DIR" | tail -1)
+  R_CPU_GIVEN=0; R_MEM_GIVEN=0; R_SWAP_GIVEN=0; R_DISK_GIVEN=0; R_COUNT=0
+  for n in $(g_names); do
+    [ "$n" = "${1:-}" ] && continue
+    c="$(g_conf "$n")"; R_COUNT=$((R_COUNT + 1))
+    R_CPU_GIVEN="$(awk -v a="$R_CPU_GIVEN" -v b="$(kv_get "$c" CPU)" 'BEGIN{printf "%g", a+b}')"
+    R_MEM_GIVEN=$((R_MEM_GIVEN + $(to_bytes "$(kv_get "$c" RAM)" || echo 0)))
+    R_SWAP_GIVEN=$((R_SWAP_GIVEN + $(to_bytes "$(kv_get "$c" SWAP)" || echo 0)))
+    R_DISK_GIVEN=$((R_DISK_GIVEN + $(to_bytes "$(kv_get "$c" DISK)" || echo 0)))
+  done
+  R_CPU_LEFT="$(awk -v t="$R_CPUS" -v g="$R_CPU_GIVEN" 'BEGIN{printf "%g", t-g}')"
+  R_MEM_LEFT=$((R_MEM - HOST_RESERVE - R_MEM_GIVEN))
+  R_SWAP_LEFT=$((R_SWAP - R_SWAP_GIVEN))
+}
+pct() { awk -v g="$1" -v t="$2" 'BEGIN{ if (t > 0) printf "%d%%", g * 100 / t + 0.5; else print "-" }'; }
+left_text() { # value-is-number "text if positive" "amount over" -> green / yellow text
+  if [ "$1" = ok ]; then printf '%s%s%s' "$C_G" "$2" "$C_0"; else printf '%soversold by %s%s' "$C_Y" "$2" "$C_0"; fi
+}
+res_show() {
+  local cpu_l mem_l swap_l disk_l
+  if awk -v l="$R_CPU_LEFT" 'BEGIN{exit !(l >= 0)}'; then cpu_l="$(left_text ok "$R_CPU_LEFT")"
+  else cpu_l="$(left_text over "$(awk -v l="$R_CPU_LEFT" 'BEGIN{printf "%g", -l}')")"; fi
+  if [ "$R_MEM_LEFT" -ge 0 ]; then mem_l="$(left_text ok "$(human "$R_MEM_LEFT")")"; else mem_l="$(left_text over "$(human $((-R_MEM_LEFT)))")"; fi
+  if [ "$R_SWAP_LEFT" -ge 0 ]; then swap_l="$(left_text ok "$(human "$R_SWAP_LEFT")")"; else swap_l="$(left_text over "$(human $((-R_SWAP_LEFT)))")"; fi
+  if [ "$R_DFREE" -gt 1073741824 ]; then disk_l="$(left_text ok "$(human "$R_DFREE")")"; else disk_l="${C_R}$(human "$R_DFREE")${C_0}"; fi
+  printf '  %s%-11s %-10s %-24s %s%s\n' "$C_BD" "" "SERVER" "GIVEN TO $R_COUNT MACHINE(S)" "FREE FOR NEW ONES" "$C_0"
+  printf '  %-11s %-10s %-24s %s\n' "CPU cores" "$R_CPUS" "$R_CPU_GIVEN ($(pct "$R_CPU_GIVEN" "$R_CPUS"))" "$cpu_l"
+  printf '  %-11s %-10s %-24s %s\n' "RAM" "$(human "$R_MEM")" "$(human "$R_MEM_GIVEN") ($(pct "$R_MEM_GIVEN" "$R_MEM"))" "$mem_l  ${C_D}(256M kept for the server)${C_0}"
+  printf '  %-11s %-10s %-24s %s\n' "Swap" "$(human "$R_SWAP")" "$(human "$R_SWAP_GIVEN") ($(pct "$R_SWAP_GIVEN" "$R_SWAP"))" "$swap_l"
+  printf '  %-11s %-10s %-24s %s\n' "Disk" "$(human "$R_DTOT")" "$(human "$R_DISK_GIVEN") ($(pct "$R_DISK_GIVEN" "$R_DTOT"))" "$disk_l  ${C_D}(really free now)${C_0}"
+  printf '  %sCPU, RAM and swap may be oversold (machines are rarely all busy); disk space cannot.%s\n' "$C_D" "$C_0"
+}
+cmd_resources() {
+  parse_flags "$@"; need_root; need_installed; s_load
+  printf '\n%sServer resources%s  (%s)\n' "$C_BD" "$C_0" "$(. /etc/os-release; echo "$PRETTY_NAME")"
+  res_compute; res_show
+}
+# warnings when a new or changed machine would oversell the server (needs res_compute without it)
+oversell_warn() { # cpu ram swap
+  local c m s
+  c="$(awk -v a="$R_CPU_GIVEN" -v b="$1" 'BEGIN{printf "%g", a+b}')"
+  m=$((R_MEM_GIVEN + $(to_bytes "$2" || echo 0))); s=$((R_SWAP_GIVEN + $(to_bytes "$3" || echo 0)))
+  awk -v c="$c" -v t="$R_CPUS" 'BEGIN{exit !(c > t)}' \
+    && warn "CPU oversold: machines get $c cores in total, the server has $R_CPUS"
+  [ "$m" -gt $((R_MEM - HOST_RESERVE)) ] \
+    && warn "RAM oversold: machines get $(human "$m"), the server has $(human "$R_MEM") (256M kept for itself)"
+  [ "$s" -gt "$R_SWAP" ] \
+    && warn "swap oversold: machines get $(human "$s"), the server has $(human "$R_SWAP") swap"
+  return 0
+}
+size_ok() { local b m; b="$(to_bytes "$1")" && m="$(to_bytes "$2")" && [ "$b" -ge "$m" ]; }
+cpu_ok() { valid_num "$1" && [ "$(cpu_quota "$1")" -ge 1000 ] && [ "$(cpu_quota "$1")" -le $(( $(host_cpus) * 100000 )) ]; }
+
 # ================================================================ STATUS ===
 cmd_status() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local n cpus mem avail sw swf dtot dfree cnt=0 run=0 sc=0 sr=0 ss=0 sd=0 u1 pct
+  local n cpus mem avail sw swf dtot dfree cnt=0 run=0 u1 pct
   declare -A U0=()
   cpus="$(host_cpus)"; mem="$(host_mem)"; avail="$(host_memavail)"; sw="$(host_swap)"
   swf="$(awk '/^SwapFree:/{printf "%.0f\n", $2*1024}' /proc/meminfo)"
   read -r dtot dfree < <(df -B1 --output=size,avail "$VAR_DIR" | tail -1)
   for n in $(g_names); do
-    g_load "$n"; cnt=$((cnt + 1))
-    sc="$(awk -v a="$sc" -v b="$G_CPU" 'BEGIN{printf "%g", a+b}')"
-    sr=$((sr + $(to_bytes "$G_RAM"))); ss=$((ss + $(to_bytes "$G_SWAP"))); sd=$((sd + $(to_bytes "$G_DISK")))
+    cnt=$((cnt + 1))
     if g_running "$n"; then run=$((run + 1)); U0[$n]="$(cg_read "$n" cpu.stat | awk '/^usage_usec/{print $2}')"; fi
   done
   printf '%sServer%s\n' "$C_BD" "$C_0"
@@ -2235,8 +2381,9 @@ cmd_status() {
   printf '  Swap       : %s used of %s\n' "$(human $((sw - swf)))" "$(human "$sw")"
   printf '  Disk       : %s free of %s\n' "$(human "$dfree")" "$(human "$dtot")"
   printf '  Network    : public IP %s, main card %s, bridge %s %s/16\n' "$(public_ip)" "$(wan_if)" "$S_BRIDGE" "$(gw_ip)"
+  printf '\n%sResources%s\n' "$C_BD" "$C_0"
+  res_compute; res_show
   printf '\n%sMachines%s: %s (%s running)\n' "$C_BD" "$C_0" "$cnt" "$run"
-  printf '  Given out  : CPU %s of %s | RAM %s of %s | swap %s | disk %s\n' "$sc" "$cpus" "$(human "$sr")" "$(human "$mem")" "$(human "$ss")" "$(human "$sd")"
   [ "$cnt" -gt 0 ] || return 0
   sleep 1
   printf '\n%s%-14s %-8s %-12s %-15s %-15s %-15s %s%s\n' "$C_BD" NAME STATE "CPU now/max" "RAM" "SWAP" "DISK" TRAFFIC "$C_0"
@@ -2499,7 +2646,7 @@ menu_main() {
      4) Dedicated IPs
      5) Domain proxy (websites on ports 80/443)
    ${C_BD}Server${C_0}
-     6) Host status and usage
+     6) Server resources and usage (cores, RAM, disk: total / given / free)
      7) Backups
      8) Settings
      9) Install / repair
@@ -2569,9 +2716,14 @@ menu_resources() {
   (
     s_load; g_load "$1"
     local cpu ram swap disk pids iom ioi args=()
-    echo
-    ask cpu "CPU cores" "$G_CPU"; ask ram "RAM" "$G_RAM"; ask swap "Swap" "$G_SWAP"
-    ask disk "Disk (growing works live, shrinking needs the machine stopped)" "$G_DISK"
+    printf '\n%sServer resources%s (without %s):\n' "$C_BD" "$C_0" "$1"
+    res_compute "$1"; res_show
+    printf '\n  %s now has: CPU %s | RAM %s | swap %s | disk %s\n\n' "$1" "$G_CPU" "$G_RAM" "$G_SWAP" "$G_DISK"
+    ask cpu "CPU cores (free without $1: $R_CPU_LEFT)" "$G_CPU"
+    ask ram "RAM (free without $1: $(human "$(( R_MEM_LEFT > 0 ? R_MEM_LEFT : 0 ))"))" "$G_RAM"
+    ask swap "Swap (free without $1: $(human "$(( R_SWAP_LEFT > 0 ? R_SWAP_LEFT : 0 ))"))" "$G_SWAP"
+    ask disk "Disk ($(human "$R_DFREE") free; growing works live, shrinking needs the machine stopped)" "$G_DISK"
+    oversell_warn "$cpu" "$ram" "$swap"
     ask pids "Max processes" "$G_PIDS"
     ask iom "Disk speed limit in MB/s (0 = none)" "$G_IO_MBPS"; ask ioi "Disk IOPS limit (0 = none)" "$G_IO_IOPS"
     [ "$cpu" != "$G_CPU" ] && args+=(--cpu "$cpu")
@@ -2780,7 +2932,8 @@ Machines
            [--autostart on|off] [--tun on|off]
   renew NAME DAYS|YYYY-MM-DD [--reset-traffic]
   traffic NAME [--reset]
-  passwd NAME [PASSWORD]              sshkey NAME "ssh-ed25519 AAAA..."
+  passwd NAME ['ANY PASSWORD']        (any characters; or --password '...')
+  sshkey NAME "ssh-ed25519 AAAA..."
   console NAME                        exec NAME -- COMMAND...
   reinstall NAME [--os OS] [--password P]
   backup NAME                         restore FILE [NEW_NAME]
@@ -2797,6 +2950,7 @@ Network
 
 Server
   install [--swap SIZE | --no-swap] [--prebuild]
+  resources                           server cores / RAM / swap / disk: total, given, free
   status                              image list | build OS | delete OS
   settings [show | set KEY VALUE]     update | uninstall [--purge]
 
@@ -2832,6 +2986,7 @@ main() {
     restore) cmd_restore "$@" ;;
     delete|remove|rm|destroy) cmd_delete "$@" ;;
     status|host|stats) cmd_status "$@" ;;
+    resources|res|free) cmd_resources "$@" ;;
     image|images) cmd_image "$@" ;;
     settings|config) cmd_settings "$@" ;;
     apply) cmd_apply "$@" ;;

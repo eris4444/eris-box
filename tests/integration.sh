@@ -111,11 +111,22 @@ echo "  INFO  host: swappiness $(cat /proc/sys/vm/swappiness), kernel $(uname -r
 check "memory.high = 90% of RAM" eq "$(cgv t1 memory.high)" $((209715200 / 10 * 9))
 check "df shows ~2G disk inside" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 1700 2100
 check "hostname inside" eq "$(inside t1 hostname)" t1
-check "login message shows the plan" inside t1 grep -q 'RAM 200M | swap 1G | disk 2G' /etc/motd
+check "login banner installed" inside t1 test -x /etc/update-motd.d/00-erisbox
+check "distro login messages switched off" inside t1 sh -c 'for f in /etc/update-motd.d/*; do [ "$f" = /etc/update-motd.d/00-erisbox ] || [ ! -x "$f" ] || exit 1; done; [ ! -s /etc/motd ]'
+BANNER="$(inside t1 run-parts /etc/update-motd.d 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+echo "$BANNER" | sed 's/^/          banner: /'
+check "banner shows the machine name" grep -q 'T 1' <<<"$BANNER"
+check "banner shows the OS" grep -qF "$(inside t1 sh -c '. /etc/os-release; echo "$PRETTY_NAME"')" <<<"$BANNER"
+check "banner shows no RAM / CPU / disk numbers" not grep -qiwE 'ram|swap|disk|cpu|memory|[0-9]+(M|G)i?B?' <<<"$BANNER"
+check "password is stored base64, not in plain text" sh -c "grep -q '^PASSWORD64=' /etc/erisbox/guests/t1.conf && ! grep -q '^PASSWORD=' /etc/erisbox/guests/t1.conf"
+check "resources view" sh -c "$EB resources | grep -q 'CPU cores'"
+check "resources count t1" sh -c "$EB resources | grep -q 'GIVEN TO 1 MACHINE'"
 check "t1 reaches the internet" retry 30 inside t1 curl -fsS -o /dev/null --max-time 10 https://deb.debian.org/
 check "apt works inside t1" inside t1 sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null'
 check "SSH banner on $HOSTIP:$SSH1" retry 30 is_ssh banner cli "$HOSTIP" "$SSH1"
 check "SSH password login" eq "$(ip netns exec cli sshpass -p Test-Pass-1234 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP hostname)" t1
+LOGIN="$(ip netns exec cli sshpass -p Test-Pass-1234 ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP exit 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+check "a real SSH login shows the colourful banner" grep -q 'T 1' <<<"$LOGIN"
 inside t1 sh -c 'mkdir -p /srv && echo hello-t1 > /srv/index.html'
 guest_service t1 web1 /usr/bin/python3 -m http.server "$P1" --directory /srv
 check "port range forward $HOSTIP:$P1" retry 20 sh -c "[ \"\$(ip netns exec cli curl -fsS --max-time 5 http://$HOSTIP:$P1/)\" = hello-t1 ]"
@@ -151,7 +162,6 @@ check "cpu.max = 0.5" eq "$(cgv t1 cpu.max)" "50000 100000"
 check "memory.max = 300M" eq "$(cgv t1 memory.max)" 314572800
 check "memory.swap.max = 512M" eq "$(cgv t1 memory.swap.max)" 536870912
 check "disk grew online to ~3G" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 2700 3100
-check "login message follows the change" inside t1 grep -q 'RAM 300M | swap 512M | disk 3G' /etc/motd
 check "set speed 8 Mbit" $EB set t1 --speed 8 -y
 check "tbf qdisc on ebx$ID1" sh -c "tc qdisc show dev ebx$ID1 | grep -q tbf"
 check "ingress policer on ebx$ID1" sh -c "tc filter show dev ebx$ID1 ingress | grep -q police"
@@ -162,12 +172,15 @@ check "remove speed limit" $EB set t1 --speed 0 -y
 check "no qdisc left" not sh -c "tc qdisc show dev ebx$ID1 | grep -q tbf"
 
 section "create t2 ($OS_B, image built on demand)"
-check "create t2" $EB create t2 --os "$OS_B" --ports none --password Test-Pass-5678 -y
+PW2=$'t2 p@ss:w"o\'rd $HOME \\ ü'
+check "create t2 with an unusual password" $EB create t2 --os "$OS_B" --ports none --password "$PW2" -y
 SSH2="$(conf t2 SSH_PORT)"
 check "t2 running" running t2
 check "t2 booted" retry 90 booted t2
 check "t2 is $OS_B" inside t2 grep -q "ID=${OS_B%%-*}" /etc/os-release
 check "SSH banner on $HOSTIP:$SSH2" retry 30 is_ssh banner cli "$HOSTIP" "$SSH2"
+check "SSH login to t2 with the unusual password" eq "$(ip netns exec cli sshpass -p "$PW2" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH2" root@$HOSTIP hostname)" t2
+check "t2 banner shows Debian" sh -c "$EB exec t2 -- run-parts /etc/update-motd.d | grep -q Debian"
 check "t2 reaches the internet" retry 30 inside t2 curl -fsS -o /dev/null --max-time 10 https://deb.debian.org/
 check "machines are isolated from each other" not inside t2 ping -c1 -W2 "$IP1"
 check "hairpin: t2 reaches t1 through the public port" eq "$(inside t2 curl -fsS --max-time 5 "http://$HOSTIP:$P1/")" hello-t1
@@ -280,6 +293,13 @@ check "dedicated IP after autostart" retry 30 is_ssh banner cli 198.51.100.77 22
 section "password, backup, restore, reinstall"
 check "passwd t1" $EB passwd t1 New-Pass-9999 -y
 check "login with the new password" retry 20 sh -c "[ \"\$(ip netns exec cli sshpass -p New-Pass-9999 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p 2299 root@$HOSTIP hostname)\" = t1 ]"
+PW1=$'1'
+check "passwd t1 with a 1-character password" $EB passwd t1 --password "$PW1" -y
+check "login with the 1-character password" retry 10 eq "$(ip netns exec cli sshpass -p "$PW1" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p 2299 root@$HOSTIP hostname)" t1
+PW3='with spaces & "quotes" : $(not run) ; رمز'
+check "passwd t1 with spaces, quotes and Persian" $EB passwd t1 "$PW3" -y
+check "login with it" eq "$(ip netns exec cli sshpass -p "$PW3" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p 2299 root@$HOSTIP hostname)" t1
+check "info shows it exactly" sh -c "$EB info t1 | grep -qF 'Password   : $PW3'"
 inside t2 touch /root/marker
 check "backup t2" $EB backup t2 -y
 BK="$(ls -t /var/lib/erisbox/backups/t2-*.tar.zst | head -1)"

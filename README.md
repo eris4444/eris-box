@@ -57,9 +57,29 @@ You get everything you need to send to the user:
   Ports      : 1.2.3.4:20001-20010 (tcp+udp, same numbers inside)
 ```
 
-Inside the machine, `free -h` and `df -h /` show the machine's own RAM and disk, not the
-whole server's, and the login message shows its plan. (With the lxcfs version in Ubuntu
-22.04/24.04, `free` shows 0 swap. The machine can still use its full swap allowance.)
+The root password can be anything you like (spaces, quotes, symbols, any language):
+`--password 'my secret: "x" $1'`. Without one, a random password is generated.
+
+When the user logs in, they see a colourful welcome banner with the machine's name, OS,
+uptime and date. It never shows the RAM, CPU or disk numbers. Inside the machine, `free -h`
+and `df -h /` show the machine's own RAM and disk, not the whole server's. (With the lxcfs
+version in Ubuntu 22.04/24.04, `free` shows 0 swap. The machine can still use its full swap.)
+
+## Plan with the server's resources
+
+`erisbox resources` (also shown in the create wizard, in "change resources" and in `status`):
+
+```
+              SERVER     GIVEN TO 2 MACHINE(S)    FREE FOR NEW ONES
+  CPU cores   1          0.7 (70%)                0.3
+  RAM         961M       500M (52%)               205M  (256M kept for the server)
+  Swap        2G         2G (100%)                0B
+  Disk        9.6G       4G (42%)                 3.4G  (really free now)
+```
+
+The wizard shows next to every question how much is still free, suggests a disk size that
+really fits, and warns when you oversell CPU, RAM or swap. Overselling is allowed, but disk
+space can't be oversold.
 
 ## Features
 
@@ -126,6 +146,8 @@ erisbox renew alice 30            # +30 days (from the current expiry)
 erisbox port add alice 25565      # also 30000-30010 or 8080:80, --proto tcp|udp|both
 erisbox port ssh alice 2222
 erisbox passwd alice              # new random root password
+erisbox passwd alice 'any thing!' # or your own - any characters
+erisbox resources                 # server cores / RAM / swap / disk: total, given, free
 erisbox console alice             # root shell inside
 erisbox exec alice -- apt-get update
 erisbox backup alice              # -> /var/lib/erisbox/backups/
@@ -190,6 +212,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eris4444/eris-box/main/insta
 بعد از نصب منو باز می‌شود. دفعه‌های بعد فقط بنویس `erisbox`.
 
 - **ساخت ماشین:** `erisbox create ali --cpu 0.2 --ram 200M --swap 1G --disk 2G`
+  (پسورد root می‌تواند هر چیزی باشد: `--password 'هر چیزی'`)
+- **منابع سرور:** `erisbox resources` نشان می‌دهد سرور چند هسته، چقدر رم و دیسک دارد، چقدرش را
+  به ماشین‌ها داده‌ای و چقدر آزاد مانده. در ساخت ماشین هم کنار هر سؤال مقدار آزاد را می‌بینی.
+- **پیام ورود ماشین:** فقط اسم ماشین و سیستم‌عاملش، رنگی. رم و CPU و دیسک را نشان نمی‌دهد.
 - **IP اختصاصی:** اول IP را از شرکت سرورت بخر و به همین سرور وصل کن، بعد:
   `erisbox ip add ali 5.6.7.8` (حداکثر ۲ IP برای هر ماشین؛ همه‌ی پورت‌ها مال همان ماشین می‌شود)
 - **پورت روی IP خود سرور:** هر ماشین یک پورت SSH و یک بازه پورت می‌گیرد. پورت بیشتر:
