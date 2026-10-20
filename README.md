@@ -133,6 +133,28 @@ and gets its own certificates (Let's Encrypt HTTP-01 works through the proxy). I
 server itself already uses 443 (for example for a VPN), move that program to another
 port and send unknown names to it: `erisbox domain default-tls 127.0.0.1:8443`.
 
+## Sell from a bot (API)
+
+Define what you sell, start the API, and give your Telegram bot the URL and a token:
+
+```bash
+erisbox plan add small --title "Small VPS" --cpu 0.2 --ram 200M --swap 1G --disk 2G --days 30 --traffic 100
+erisbox api enable                 # HTTPS on :9443, prints the first token
+erisbox api allow 203.0.113.50     # optional: only your bot's server
+```
+
+The bot then sells directly:
+
+```bash
+curl -sk --pinnedpubkey "$(erisbox api pin)" -H "Authorization: Bearer eb_..." \
+     -X POST https://1.2.3.4:9443/api/v1/machines -d '{"plan":"small"}'
+```
+
+The answer contains the SSH address, port, password and a ready message for the customer
+(`text`, `text_fa`). Renew, change password, stop/start, resize, extra IPs and ports, and
+delete all work through the API too. Automatic sales stop when a plan no longer fits on the
+server (configurable limits, `409 server_full`). Full reference with PHP code: **[docs/API.md](docs/API.md)**.
+
 ## Command line
 
 Everything in the menu is also a command (add `-y` to skip questions):
@@ -224,6 +246,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eris4444/eris-box/main/insta
 - **فروش:** محدودیت سرعت، حجم ماهانه و تاریخ انقضا:
   `erisbox set ali --speed 20 --traffic 100 --expire 30`
 - **پشتیبان:** `erisbox backup ali` و برگرداندن با `erisbox restore`
+- **فروش با ربات:** پلن بساز (`erisbox plan add small ...`) و API را روشن کن (`erisbox api enable`).
+  ربات با یک درخواست `POST /machines` و `{"plan":"small"}` ماشین را می‌سازد و پیام آماده‌ی
+  فارسی (`text_fa`) را به مشتری می‌دهد. راهنمای کامل با کد PHP: [docs/API.md](docs/API.md)
 
 ## License
 

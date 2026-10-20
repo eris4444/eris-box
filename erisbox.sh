@@ -11,7 +11,7 @@
 #
 #  Run "erisbox" for the menu or "erisbox help" for the command line.
 
-SCRIPT_VER="1.1.0"
+SCRIPT_VER="1.2.0"
 REPO="eris4444/eris-box"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
@@ -102,7 +102,7 @@ pause() {
 # ----------------------------------------------------------------- flags ---
 declare -A F=()
 POS=()
-BOOL_FLAGS=" all boot force json no-start no-swap prebuild purge reset reset-traffic wildcard "
+BOOL_FLAGS=" all boot force json no-start no-swap no-tls prebuild purge read-only reset reset-traffic strict wildcard "
 parse_flags() {
   F=(); POS=()
   local k
@@ -138,9 +138,10 @@ valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ $((10#$1)) -ge 1 ] && [ $((10#$1)
 valid_int() { [[ "$1" =~ ^[0-9]{1,9}$ ]]; }
 valid_num() { [[ "$1" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]]; }
 valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$(date -d "$1" +%F 2>/dev/null)" = "$1" ]; }
-# any characters (spaces, quotes, : $ ...), just not empty, no line break, at most 256 bytes
-valid_password() { [ -n "$1" ] && [[ "$1" != *$'\n'* ]] && [[ "$1" != *$'\r'* ]] && [ "${#1}" -le 256 ]; }
-PW_RULE="the password can be anything except empty or a line break (max 256 bytes)"
+# any visible characters (spaces, quotes, : $ ..., any language), not empty, at most 256 bytes
+valid_password() { [ -n "$1" ] && [[ "$1" != *[[:cntrl:]]* ]] && [ "${#1}" -le 256 ]; }
+PW_RULE="the password can be anything except empty, a line break or other control characters (max 256 bytes)"
+valid_title() { [ -n "$1" ] && [ "${#1}" -le 80 ] && [[ "$1" != *"'"* ]] && [[ "$1" != *[[:cntrl:]]* ]]; }
 valid_url() { [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; }
 valid_iface() { [[ "$1" =~ ^[A-Za-z0-9_.:@-]{1,15}$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
 valid_hostport() {
@@ -235,7 +236,7 @@ kv_get() { # file key
 }
 
 # -------------------------------------------------------------- settings ---
-S_KEYS="PUBLIC_IP SUBNET BRIDGE SSH_PORT_START PORT_RANGE_START PORTS_PER_GUEST DEF_OS DEF_CPU DEF_RAM DEF_SWAP DEF_DISK DEF_PIDS DNS BLOCK_SMTP BLOCK_PRIVATE QUOTA_ACTION UBUNTU_MIRROR UBUNTU_PORTS_MIRROR DEBIAN_MIRROR PROXY_ENABLED PROXY_DEFAULT_HTTP PROXY_DEFAULT_TLS"
+S_KEYS="PUBLIC_IP SUBNET BRIDGE SSH_PORT_START PORT_RANGE_START PORTS_PER_GUEST DEF_OS DEF_CPU DEF_RAM DEF_SWAP DEF_DISK DEF_PIDS DNS BLOCK_SMTP BLOCK_PRIVATE QUOTA_ACTION UBUNTU_MIRROR UBUNTU_PORTS_MIRROR DEBIAN_MIRROR PROXY_ENABLED PROXY_DEFAULT_HTTP PROXY_DEFAULT_TLS SELL_MAX_RAM_PCT SELL_MAX_CPU_PCT"
 s_defaults() {
   S_PUBLIC_IP=""; S_SUBNET="10.88"; S_BRIDGE="erisbr0"
   S_SSH_PORT_START=2201; S_PORT_RANGE_START=20001; S_PORTS_PER_GUEST=10
@@ -245,6 +246,9 @@ s_defaults() {
   S_UBUNTU_PORTS_MIRROR="http://ports.ubuntu.com/ubuntu-ports"
   S_DEBIAN_MIRROR="http://deb.debian.org/debian"
   S_PROXY_ENABLED=0; S_PROXY_DEFAULT_HTTP=""; S_PROXY_DEFAULT_TLS=""
+  # automatic sales (API / --strict) stop when the machines would get more than this share
+  # of the server: RAM in % of (RAM - 256M), CPU in % of the cores (0 = no limit)
+  S_SELL_MAX_RAM_PCT=150; S_SELL_MAX_CPU_PCT=300
 }
 s_load() { s_defaults; kv_load "$CONF_FILE" S_; }
 # shellcheck disable=SC2086
@@ -252,8 +256,9 @@ s_save() { kv_save "$CONF_FILE" S_ $S_KEYS; }
 
 # --------------------------------------------------------------- machines ---
 # the root password is kept base64-encoded (PASSWORD64) so it may contain any character
-G_KEYS="ID UIDBASE OS CPU RAM SWAP DISK PIDS IO_MBPS IO_IOPS TUN SPEED TRAFFIC_GB RESET_DAY RESET_TAG EXPIRE SSH_PORT PORTS IPS PASSWORD64 NOTE AUTOSTART CREATED"
+G_KEYS="ID UIDBASE OS CPU RAM SWAP DISK PIDS IO_MBPS IO_IOPS TUN SPEED TRAFFIC_GB RESET_DAY RESET_TAG EXPIRE SSH_PORT PORTS IPS PASSWORD64 NOTE AUTOSTART CREATED PLAN"
 g_reset() {
+  G_PLAN=""
   G_NAME=""; G_ID=""; G_UIDBASE=""; G_OS=""; G_CPU=""; G_RAM=""; G_SWAP=""; G_DISK=""; G_PIDS=512
   G_IO_MBPS=0; G_IO_IOPS=0; G_TUN=0; G_SPEED=0; G_TRAFFIC_GB=0; G_RESET_DAY=0; G_RESET_TAG=""
   G_EXPIRE=""; G_SSH_PORT=""; G_PORTS=""; G_IPS=""; G_PASSWORD=""; G_PASSWORD64=""; G_NOTE=""; G_AUTOSTART=1; G_CREATED=""
@@ -594,6 +599,10 @@ refresh_all() { # after an update: rewrite helpers + LXC configs, re-apply rules
   for n in $(g_names); do g_load "$n"; g_save; lxc_write_config; guest_banner_live; done
   G_NAME=""
   net_apply
+  if api_on; then   # new API code ships inside this script
+    api_py > "$API_PY"; chmod 700 "$API_PY"; write_api_unit
+    systemctl daemon-reload; systemctl restart erisbox-api.service
+  fi
 }
 
 # ================================================================= IMAGES ===
@@ -1824,6 +1833,20 @@ cmd_create() {
     name="$W_NAME"
   fi
   valid_name "$name" || die "invalid name '$name' (2-32 chars: a-z, 0-9 and -, starting with a letter)"
+  if has_flag plan; then   # a sales plan gives the defaults, explicit options still win
+    pl_load "$(flag plan)"
+    has_flag os || F[os]="$PL_OS"
+    has_flag cpu || F[cpu]="$PL_CPU"
+    has_flag ram || F[ram]="$PL_RAM"
+    has_flag swap || F[swap]="$PL_SWAP"
+    has_flag disk || F[disk]="$PL_DISK"
+    has_flag pids || F[pids]="$PL_PIDS"
+    has_flag ports || F[ports]="$PL_PORTS"
+    has_flag speed || F[speed]="$PL_SPEED"
+    has_flag traffic || F[traffic]="$PL_TRAFFIC_GB"
+    has_flag expire || { [ "${PL_DAYS:-0}" -gt 0 ] && F[expire]="$PL_DAYS"; }
+    has_flag tun || { [ "$PL_TUN" = 1 ] && F[tun]=on; }
+  fi
   os="$(flag os "$S_DEF_OS")"; os_resolve "$os" || die "unknown OS '$os' (choose: $OS_LIST)"
   cpu="$(flag cpu "$S_DEF_CPU")"; check_cpu "$cpu"; cpu="$(norm_cpu "$cpu")"
   ram="$(flag ram "$S_DEF_RAM")"; check_size RAM "$ram" 64M
@@ -1846,6 +1869,10 @@ cmd_create() {
   take_lock
   g_exists "$name" && die "machine '$name' already exists"
   [ -e "$LXC_DIR/$name" ] && die "an LXC container called '$name' already exists on this server"
+  if has_flag strict; then   # automatic sales: never oversell past the configured limits
+    local why
+    why="$(sell_check "$cpu" "$ram" "$disk" "$os")" || die "server is full: $why"
+  fi
   if [ "$iom" -gt 0 ] || [ "$ioi" -gt 0 ]; then
     cg_supports io.max && io_dev >/dev/null || die "disk speed limits are not supported on this server"
   fi
@@ -1889,6 +1916,7 @@ cmd_create() {
   G_IO_MBPS="$iom"; G_IO_IOPS="$ioi"; G_TUN="$tun"; G_SPEED="$speed"; G_TRAFFIC_GB="$traffic"
   G_RESET_DAY="$rday"; G_RESET_TAG="$(date +%Y-%m)"; G_EXPIRE="$expire"
   G_SSH_PORT="$sshp"; G_PORTS="$ports"; G_PASSWORD="$pw"; G_AUTOSTART=1; G_CREATED="$(date +%F)"
+  G_PLAN="$(flag plan "")"
 
   image_ensure "$os" || die "could not prepare the $os image"
   info "Creating machine $name ..."
@@ -1936,6 +1964,7 @@ show_info() {
 cmd_info() {
   parse_flags "$@"; need_root; need_installed; s_load
   g_load "${POS[0]:-}"
+  if has_flag json; then info_json; echo; return 0; fi
   show_info
   g_usage
   printf '  Using now  : RAM %s | swap %s | disk %s of %s\n' "$(human "$U_MEM")" "$(human "$U_SWAP")" "$(human "$U_DUSED")" "$(human "$U_DSIZE")"
@@ -1957,19 +1986,78 @@ cmd_list() {
   [ "$any" = 1 ] || echo "  (no machines yet - create one with: erisbox create NAME)"
 }
 list_json() {
-  local n first=1 ips
+  local n first=1
   printf '['
   for n in $(g_names); do
-    g_load "$n"; g_usage; traffic_read
-    ips="$(ip_entries | cut -d, -f1 | paste -sd' ' -)"
+    g_load "$n"
     [ "$first" = 1 ] || printf ','
     first=0
-    printf '{"name":"%s","state":"%s","os":"%s","cpu":%s,"ram":%s,"swap":%s,"disk":%s,"pids":%s,"ram_used":%s,"swap_used":%s,"disk_used":%s,"ssh_port":%s,"ports":"%s","ips":"%s","private_ip":"%s","speed_mbit":%s,"traffic_limit_gb":%s,"traffic_down":%s,"traffic_up":%s,"expire":"%s","note":"%s"}' \
-      "$n" "$(g_state "$n")" "$G_OS" "$G_CPU" "$(to_bytes "$G_RAM")" "$(to_bytes "$G_SWAP")" "$(to_bytes "$G_DISK")" "$G_PIDS" \
-      "$U_MEM" "$U_SWAP" "$U_DUSED" "${G_SSH_PORT:-0}" "$G_PORTS" "$ips" "$(g_ip)" "${G_SPEED:-0}" "$(norm_cpu "${G_TRAFFIC_GB:-0}")" \
-      "$T_TX" "$T_RX" "$G_EXPIRE" "$G_NOTE"
+    info_json
   done
   printf ']\n'
+}
+
+# ------------------------------------------------------------------ JSON ---
+# (passwords can't hold control characters, every other value is validated)
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"
+  printf '"%s"' "$s"
+}
+json_num() { if [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf '%s' "$1"; else printf '0'; fi; }
+json_bool() { if [ "$1" = 1 ]; then printf 'true'; else printf 'false'; fi; }
+
+# texts a selling bot can forward to the customer as they are
+customer_text() { # en|fa
+  local pip e pub ports="" ips=""
+  pip="$(public_ip)"
+  for e in $G_PORTS; do ports+="${ports:+, }$pip:$(port_entry_text "$e")"; done
+  while IFS=, read -r pub _; do [ -n "$pub" ] && ips+="${ips:+, }$pub"; done < <(ip_entries)
+  if [ "$1" = fa ]; then
+    printf 'سرور شما آماده است\n'
+    printf 'نام: %s\nسیستم‌عامل: %s\nآدرس: %s\nپورت SSH: %s\nنام کاربری: root\nرمز عبور: %s\n' \
+      "$G_NAME" "$(os_label "$G_OS")" "$pip" "$G_SSH_PORT" "$G_PASSWORD"
+    printf 'دستور اتصال: ssh root@%s -p %s\n' "$pip" "$G_SSH_PORT"
+    [ -n "$ports" ] && printf 'پورت‌های شما: %s\n' "$ports"
+    [ -n "$ips" ] && printf 'IP اختصاصی: %s (همه‌ی پورت‌ها)\n' "$ips"
+    printf 'تاریخ انقضا: %s' "${G_EXPIRE:-نامحدود}"
+  else
+    printf 'Your server is ready\n'
+    printf 'Name: %s\nOS: %s\nHost: %s\nSSH port: %s\nUser: root\nPassword: %s\n' \
+      "$G_NAME" "$(os_label "$G_OS")" "$pip" "$G_SSH_PORT" "$G_PASSWORD"
+    printf 'Connect: ssh root@%s -p %s\n' "$pip" "$G_SSH_PORT"
+    [ -n "$ports" ] && printf 'Your ports: %s\n' "$ports"
+    [ -n "$ips" ] && printf 'Own IP: %s (all ports)\n' "$ips"
+    printf 'Expires: %s' "${G_EXPIRE:-never}"
+  fi
+}
+
+info_json() { # the loaded machine as one JSON object
+  local pip e pub d n w ports="" ips="" doms=""
+  pip="$(public_ip)"; g_usage; traffic_read
+  for e in $G_PORTS; do
+    port_entry_parse "$e"
+    ports+="${ports:+,}{\"proto\":$(json_str "$P_PROTO"),\"from\":$P_HS,\"to\":$P_HE,\"machine_port\":$P_GS,\"text\":$(json_str "$pip:$(port_entry_text "$e")")}"
+  done
+  while IFS=, read -r pub _; do [ -n "$pub" ] && ips+="${ips:+,}$(json_str "$pub")"; done < <(ip_entries)
+  if [ -s "$DOMAIN_FILE" ]; then
+    while read -r d n w; do [ "$n" = "$G_NAME" ] && doms+="${doms:+,}$(json_str "$d")"; done < "$DOMAIN_FILE"
+  fi
+  printf '{"name":%s,"state":%s,"note":%s,"plan":%s,"os":%s,"os_label":%s,' \
+    "$(json_str "$G_NAME")" "$(json_str "$(g_state "$G_NAME")")" "$(json_str "$G_NOTE")" "$(json_str "$G_PLAN")" \
+    "$(json_str "$G_OS")" "$(json_str "$(os_label "$G_OS")")"
+  printf '"cpu":%s,"ram":%s,"ram_bytes":%s,"swap":%s,"swap_bytes":%s,"disk":%s,"disk_bytes":%s,"pids":%s,' \
+    "$(json_num "$G_CPU")" "$(json_str "$G_RAM")" "$(json_num "$(to_bytes "$G_RAM")")" "$(json_str "$G_SWAP")" \
+    "$(json_num "$(to_bytes "$G_SWAP")")" "$(json_str "$G_DISK")" "$(json_num "$(to_bytes "$G_DISK")")" "$(json_num "$G_PIDS")"
+  printf '"host":%s,"ssh_port":%s,"username":"root","password":%s,"ssh":%s,"ports":[%s],"ips":[%s],"domains":[%s],' \
+    "$(json_str "$pip")" "$(json_num "$G_SSH_PORT")" "$(json_str "$G_PASSWORD")" \
+    "$(json_str "ssh root@$pip -p $G_SSH_PORT")" "$ports" "$ips" "$doms"
+  printf '"speed_mbit":%s,"traffic_limit_gb":%s,"traffic_used_bytes":%s,"traffic_down_bytes":%s,"traffic_up_bytes":%s,' \
+    "$(json_num "${G_SPEED:-0}")" "$(json_num "${G_TRAFFIC_GB:-0}")" $((T_RX + T_TX)) "$T_TX" "$T_RX"
+  printf '"expire":%s,"created":%s,"autostart":%s,"private_ip":%s,"usage":{"ram_bytes":%s,"swap_bytes":%s,"disk_bytes":%s},' \
+    "$(json_str "$G_EXPIRE")" "$(json_str "$G_CREATED")" "$(json_bool "$G_AUTOSTART")" "$(json_str "$(g_ip)")" \
+    "$(json_num "$U_MEM")" "$(json_num "$U_SWAP")" "$(json_num "$U_DUSED")"
+  printf '"text":%s,"text_fa":%s}' "$(json_str "$(customer_text en)")" "$(json_str "$(customer_text fa)")"
 }
 
 # ============================================================ LIFE CYCLE ===
@@ -2042,10 +2130,16 @@ guest_mount_if_running() { g_running "$G_NAME" || return 0; mountpoint -q "$(g_m
 
 cmd_renew() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local name="${POS[0]:-}" v="${POS[1]:-}" base today
-  [ -n "$v" ] || die "usage: erisbox renew NAME DAYS|YYYY-MM-DD [--reset-traffic]"
+  local name="${POS[0]:-}" v="${POS[1]:-}" base today p
   take_lock
   g_load "$name"
+  if [ -z "$v" ]; then   # no days given: one period of the (given or the machine's own) plan
+    p="$(flag plan "$G_PLAN")"
+    [ -n "$p" ] || die "usage: erisbox renew NAME DAYS|YYYY-MM-DD [--reset-traffic]  (or --plan NAME)"
+    pl_load "$p"
+    [ "${PL_DAYS:-0}" -gt 0 ] || die "plan '$p' has no number of days"
+    v="$PL_DAYS"
+  fi
   today="$(date +%F)"
   if valid_int "$v"; then
     base="$today"; [ -n "$G_EXPIRE" ] && [[ "$G_EXPIRE" > "$today" ]] && base="$G_EXPIRE"
@@ -2343,8 +2437,792 @@ res_show() {
 }
 cmd_resources() {
   parse_flags "$@"; need_root; need_installed; s_load
+  res_compute
+  if has_flag json; then
+    printf '{"machines":%s,"cpus":%s,"cpu_given":%s,"cpu_free":%s,' "$R_COUNT" "$(json_num "$R_CPUS")" "$(json_num "$R_CPU_GIVEN")" "$(json_num "$R_CPU_LEFT")"
+    printf '"ram_bytes":%s,"ram_given_bytes":%s,"ram_free_bytes":%s,"host_reserve_bytes":%s,' "$R_MEM" "$R_MEM_GIVEN" "$R_MEM_LEFT" "$HOST_RESERVE"
+    printf '"swap_bytes":%s,"swap_given_bytes":%s,"swap_free_bytes":%s,' "$R_SWAP" "$R_SWAP_GIVEN" "$R_SWAP_LEFT"
+    printf '"disk_bytes":%s,"disk_given_bytes":%s,"disk_free_bytes":%s,' "$R_DTOT" "$R_DISK_GIVEN" "$R_DFREE"
+    printf '"sell_max_ram_pct":%s,"sell_max_cpu_pct":%s,"version":%s}\n' "$(json_num "$S_SELL_MAX_RAM_PCT")" "$(json_num "$S_SELL_MAX_CPU_PCT")" "$(json_str "$SCRIPT_VER")"
+    return 0
+  fi
   printf '\n%sServer resources%s  (%s)\n' "$C_BD" "$C_0" "$(. /etc/os-release; echo "$PRETTY_NAME")"
-  res_compute; res_show
+  res_show
+}
+# can a machine of this size still be sold automatically? (0 = yes, else prints why)
+sell_check() { # cpu ram disk os
+  local c maxc m maxm need
+  res_compute
+  need=$(( $(to_bytes "$3" || echo 0) + 314572800 ))
+  [ -s "$CACHE_DIR/$4.tar.zst" ] || need=$((need + 1073741824))
+  if [ "$R_DFREE" -le "$need" ]; then echo "not enough free disk (needs $(human "$need"), free $(human "$R_DFREE"))"; return 1; fi
+  if [ "${S_SELL_MAX_CPU_PCT:-0}" -gt 0 ]; then
+    c="$(awk -v a="$R_CPU_GIVEN" -v b="$1" 'BEGIN{printf "%g", a+b}')"
+    maxc="$(awk -v t="$R_CPUS" -v p="$S_SELL_MAX_CPU_PCT" 'BEGIN{printf "%g", t*p/100}')"
+    if awk -v c="$c" -v m="$maxc" 'BEGIN{exit !(c > m)}'; then
+      echo "CPU sale limit reached ($c of max $maxc cores, SELL_MAX_CPU_PCT=$S_SELL_MAX_CPU_PCT)"; return 1
+    fi
+  fi
+  if [ "${S_SELL_MAX_RAM_PCT:-0}" -gt 0 ]; then
+    m=$((R_MEM_GIVEN + $(to_bytes "$2" || echo 0)))
+    maxm=$(( (R_MEM - HOST_RESERVE) / 100 * S_SELL_MAX_RAM_PCT ))
+    if [ "$m" -gt "$maxm" ]; then
+      echo "RAM sale limit reached ($(human "$m") of max $(human "$maxm"), SELL_MAX_RAM_PCT=$S_SELL_MAX_RAM_PCT)"; return 1
+    fi
+  fi
+  [ -n "$(alloc_id)" ] || { echo "no free machine slots"; return 1; }
+  return 0
+}
+
+# ================================================================= PLANS ===
+# Sales plans: a named size + period, e.g. "small" = 0.2 CPU, 200M RAM, 1G swap, 2G disk, 30 days.
+PLAN_DIR=$ETC_DIR/plans
+PL_KEYS="TITLE OS CPU RAM SWAP DISK PIDS PORTS SPEED TRAFFIC_GB DAYS TUN"
+pl_reset() {
+  PL_TITLE=""; PL_OS="$S_DEF_OS"; PL_CPU="$S_DEF_CPU"; PL_RAM="$S_DEF_RAM"; PL_SWAP="$S_DEF_SWAP"; PL_DISK="$S_DEF_DISK"
+  PL_PIDS="$S_DEF_PIDS"; PL_PORTS="$S_PORTS_PER_GUEST"; PL_SPEED=0; PL_TRAFFIC_GB=0; PL_DAYS=30; PL_TUN=0
+}
+pl_exists() { valid_name "$1" && [ -f "$PLAN_DIR/$1.conf" ]; }
+pl_load() { pl_exists "$1" || die "plan '$1' not found (see: erisbox plan list)"; pl_reset; kv_load "$PLAN_DIR/$1.conf" PL_; }
+pl_names() { local f; for f in "$PLAN_DIR"/*.conf; do [ -e "$f" ] || continue; f="${f##*/}"; valid_name "${f%.conf}" && echo "${f%.conf}"; done; }
+
+cmd_plan() {
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  parse_flags "$@"; need_root; need_installed; s_load
+  local name="${POS[0]:-}" n v why first=1
+  case "$sub" in
+    list|ls)
+      if has_flag json; then
+        printf '['
+        for n in $(pl_names); do
+          pl_load "$n"
+          [ "$first" = 1 ] || printf ','
+          first=0
+          if why="$(sell_check "$PL_CPU" "$PL_RAM" "$PL_DISK" "$PL_OS")"; then v=1; why=""; else v=0; fi
+          printf '{"name":%s,"title":%s,"os":%s,"os_label":%s,"cpu":%s,"ram":%s,"swap":%s,"disk":%s,"pids":%s,"ports":%s,"speed_mbit":%s,"traffic_gb":%s,"days":%s,"tun":%s,"available":%s,"unavailable_reason":%s}' \
+            "$(json_str "$n")" "$(json_str "$PL_TITLE")" "$(json_str "$PL_OS")" "$(json_str "$(os_label "$PL_OS")")" \
+            "$(json_num "$PL_CPU")" "$(json_str "$PL_RAM")" "$(json_str "$PL_SWAP")" "$(json_str "$PL_DISK")" "$(json_num "$PL_PIDS")" \
+            "$(json_str "$PL_PORTS")" "$(json_num "$PL_SPEED")" "$(json_num "$PL_TRAFFIC_GB")" "$(json_num "$PL_DAYS")" \
+            "$(json_bool "$PL_TUN")" "$(json_bool "$v")" "$(json_str "$why")"
+        done
+        printf ']\n'
+        return 0
+      fi
+      printf '%s  %-12s %-20s %-13s %-5s %-6s %-6s %-6s %-6s %-8s %s%s\n' "$C_BD" PLAN TITLE OS CPU RAM SWAP DISK DAYS TRAFFIC "CAN SELL NOW" "$C_0"
+      for n in $(pl_names); do
+        pl_load "$n"
+        if why="$(sell_check "$PL_CPU" "$PL_RAM" "$PL_DISK" "$PL_OS")"; then why="${C_G}yes${C_0}"; else why="${C_Y}no - $why${C_0}"; fi
+        printf '  %-12s %-20s %-13s %-5s %-6s %-6s %-6s %-6s %-8s %s\n' "$n" "$PL_TITLE" "$(os_label "$PL_OS")" "$PL_CPU" "$PL_RAM" "$PL_SWAP" "$PL_DISK" \
+          "$PL_DAYS" "$( [ "${PL_TRAFFIC_GB:-0}" = 0 ] && echo unlimited || echo "${PL_TRAFFIC_GB}G")" "$why"
+        first=0
+      done
+      [ "$first" = 0 ] || echo "  (no plans yet - add one: erisbox plan add small --cpu 0.2 --ram 200M --swap 1G --disk 2G --days 30)" ;;
+    add|set|edit)
+      valid_name "$name" || die "usage: erisbox plan add NAME [--title T] [--os OS] [--cpu 0.2] [--ram 200M] [--swap 1G] [--disk 2G] [--days 30] [--traffic GB] [--speed MBIT] [--ports N|none] [--pids N] [--tun on|off]"
+      take_lock
+      pl_reset; PL_TITLE="$name"
+      [ -f "$PLAN_DIR/$name.conf" ] && kv_load "$PLAN_DIR/$name.conf" PL_
+      if has_flag title; then v="$(flag title)"; valid_title "$v" || die "--title: 1-80 characters, no ' or line breaks"; PL_TITLE="$v"; fi
+      if has_flag os; then v="$(flag os)"; os_resolve "$v" || die "unknown OS (choose: $OS_LIST)"; PL_OS="$v"; fi
+      if has_flag cpu; then v="$(flag cpu)"; check_cpu "$v"; PL_CPU="$(norm_cpu "$v")"; fi
+      if has_flag ram; then v="$(flag ram)"; check_size RAM "$v" 64M; PL_RAM="${v^^}"; fi
+      if has_flag swap; then v="$(flag swap)"; check_size swap "$v" 0; PL_SWAP="${v^^}"; fi
+      if has_flag disk; then v="$(flag disk)"; check_size disk "$v" 1G; PL_DISK="${v^^}"; fi
+      if has_flag pids; then v="$(flag pids)"; valid_int "$v" && [ "$v" -ge 64 ] || die "--pids >= 64"; PL_PIDS="$v"; fi
+      if has_flag ports; then v="$(flag ports)"; { [ "$v" = none ] || { valid_int "$v" && [ "$v" -le 1000 ]; }; } || die "--ports: a count (0-1000) or none"; PL_PORTS="$v"; fi
+      if has_flag speed; then v="$(flag speed)"; valid_int "$v" || die "--speed is Mbit/s"; PL_SPEED="$v"; fi
+      if has_flag traffic; then v="$(flag traffic)"; valid_num "$v" || die "--traffic is GB"; PL_TRAFFIC_GB="$(norm_num "$v")"; fi
+      if has_flag days; then v="$(flag days)"; valid_int "$v" || die "--days is a number (0 = never expires)"; PL_DAYS=$((10#$v)); fi
+      if has_flag tun; then case "$(flag tun)" in on|1|yes) PL_TUN=1 ;; off|0|no) PL_TUN=0 ;; *) die "--tun on|off" ;; esac; fi
+      mkdir -p "$PLAN_DIR"; chmod 700 "$PLAN_DIR"
+      # shellcheck disable=SC2086
+      kv_save "$PLAN_DIR/$name.conf" PL_ $PL_KEYS
+      log "plan $name saved"
+      ok "plan $name: $PL_TITLE | $(os_label "$PL_OS") | CPU $PL_CPU | RAM $PL_RAM | swap $PL_SWAP | disk $PL_DISK | $PL_DAYS days" ;;
+    del|delete|rm|remove)
+      pl_exists "$name" || die "plan '$name' not found"
+      rm -f "$PLAN_DIR/$name.conf"; ok "plan $name deleted (machines made from it keep running)" ;;
+    *) die "usage: erisbox plan list [--json] | add NAME [options] | del NAME" ;;
+  esac
+}
+
+# =================================================================== API ===
+# A small HTTPS JSON API (Python 3 standard library) so a selling bot can create and manage machines.
+API_CONF=$ETC_DIR/api.conf
+API_TOKENS=$ETC_DIR/api-tokens
+API_DIR=$ETC_DIR/api
+API_PY=$LIB_DIR/api.py
+A_KEYS="PORT TLS CERT KEY ALLOW"
+a_load() { A_PORT=9443; A_TLS=1; A_CERT="$API_DIR/cert.pem"; A_KEY="$API_DIR/key.pem"; A_ALLOW=""; kv_load "$API_CONF" A_; }
+# shellcheck disable=SC2086
+a_save() { kv_save "$API_CONF" A_ $A_KEYS; }
+api_on() { systemctl is-enabled erisbox-api.service >/dev/null 2>&1; }
+api_url() { if [ "$A_TLS" = 1 ]; then printf 'https://%s:%s/api/v1' "$(public_ip)" "$A_PORT"; else printf 'http://%s:%s/api/v1' "$(public_ip)" "$A_PORT"; fi; }
+api_pin() { # public-key pin for curl --pinnedpubkey / PHP CURLOPT_PINNEDPUBLICKEY
+  [ -f "$A_CERT" ] || return 1
+  printf 'sha256//%s' "$(openssl x509 -in "$A_CERT" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)"
+}
+valid_allow() { # "any" or comma separated IPv4 / CIDR
+  local x
+  [ "$1" = any ] && return 0
+  [ -n "$1" ] || return 1
+  for x in ${1//,/ }; do
+    [[ "$x" == */* ]] && { valid_int "${x#*/}" && [ "${x#*/}" -le 32 ] || return 1; x="${x%/*}"; }
+    valid_ipv4 "$x" || return 1
+  done
+}
+write_api_unit() {
+  cat > "$UNIT_DIR/erisbox-api.service" <<EOF
+[Unit]
+Description=Eris Box API for selling bots
+After=network-online.target erisbox-net.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 $API_PY
+Restart=on-failure
+RestartSec=3
+Environment=NO_COLOR=1
+MemoryMax=80M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+cmd_api() {
+  local sub="${1:-status}"; [ $# -gt 0 ] && shift
+  case "$sub" in token|tokens) api_token "$@"; return ;; esac
+  parse_flags "$@"; need_root; need_installed; s_load; a_load
+  case "$sub" in
+    enable|on|install) take_lock; api_enable ;;
+    disable|off) take_lock; api_disable ;;
+    status|info) api_status ;;
+    pin) api_pin; echo ;;
+    allow)
+      valid_allow "${POS[0]:-}" || die "usage: erisbox api allow any | IP[,IP/CIDR...]   (the IPs your bot calls from)"
+      if [ "${POS[0]}" = any ]; then A_ALLOW=""; else A_ALLOW="${POS[0]}"; fi
+      a_save; api_on && systemctl restart erisbox-api
+      ok "API allowed from: ${A_ALLOW:-anywhere (token required)}" ;;
+    restart) api_on || die "the API is not enabled"; systemctl restart erisbox-api; ok "API restarted" ;;
+    *) die "usage: erisbox api enable [--port N] [--allow IPs] [--no-tls | --cert F --key F] | disable | status | pin | allow IPs|any | token add|list|del" ;;
+  esac
+}
+
+api_enable() {
+  local p i
+  command -v python3 >/dev/null 2>&1 || apt_install python3 || die "python3 is needed for the API"
+  if has_flag port; then p="$(flag port)"; valid_port "$p" || die "invalid --port"; A_PORT=$((10#$p)); fi
+  if has_flag no-tls; then A_TLS=0; warn "plain HTTP: tokens travel unencrypted - only use this behind your own HTTPS proxy"; fi
+  if has_flag cert || has_flag key; then
+    [ -f "$(flag cert)" ] && [ -f "$(flag key)" ] || die "--cert and --key must both be existing files"
+    A_CERT="$(readlink -f "$(flag cert)")"; A_KEY="$(readlink -f "$(flag key)")"; A_TLS=1
+  fi
+  if has_flag allow; then
+    valid_allow "$(flag allow)" || die "--allow takes IPs / CIDRs separated by commas (or any)"
+    if [ "$(flag allow)" = any ]; then A_ALLOW=""; else A_ALLOW="$(flag allow)"; fi
+  fi
+  port_free_any_guest "$A_PORT" || die "port $A_PORT is forwarded to machine $PORT_OWNER - choose another --port"
+  if ! systemctl is-active --quiet erisbox-api && ss -Hltn "sport = :$A_PORT" 2>/dev/null | grep -q .; then
+    die "port $A_PORT is already used on this server - choose another: erisbox api enable --port N"
+  fi
+  mkdir -p "$API_DIR"; chmod 700 "$API_DIR"
+  if [ "$A_TLS" = 1 ] && [ "$A_CERT" = "$API_DIR/cert.pem" ] && [ ! -s "$A_CERT" ]; then
+    info "Creating a TLS certificate for the API ..."
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+      -subj "/CN=erisbox-api" -addext "subjectAltName=IP:$(public_ip)" \
+      -keyout "$API_DIR/key.pem" -out "$API_DIR/cert.pem" >/dev/null 2>&1 || die "could not create the certificate"
+    chmod 600 "$API_DIR/key.pem"
+  fi
+  a_save
+  touch "$API_TOKENS"; chmod 600 "$API_TOKENS"
+  mkdir -p "$LIB_DIR"; api_py > "$API_PY"; chmod 700 "$API_PY"
+  write_api_unit
+  systemctl daemon-reload
+  systemctl enable erisbox-api.service >/dev/null 2>&1
+  systemctl restart erisbox-api.service || die "the API service did not start (journalctl -u erisbox-api)"
+  for i in $(seq 1 20); do ss -Hltn "sport = :$A_PORT" 2>/dev/null | grep -q . && break; sleep 0.5; done
+  ss -Hltn "sport = :$A_PORT" 2>/dev/null | grep -q . || die "the API does not listen on port $A_PORT (journalctl -u erisbox-api)"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw allow "$A_PORT/tcp" >/dev/null; fi
+  log "api enabled on port $A_PORT"
+  ok "API is running"
+  if [ ! -s "$API_TOKENS" ]; then
+    info "Creating the first API token (name: bot)"
+    api_token add bot
+  fi
+  api_status
+}
+
+api_disable() {
+  systemctl disable --now erisbox-api.service >/dev/null 2>&1
+  rm -f "$UNIT_DIR/erisbox-api.service"; systemctl daemon-reload
+  log "api disabled"
+  ok "API stopped (tokens and certificate are kept for next time)"
+}
+
+api_status() {
+  local pin
+  printf '\n%sAPI for selling bots%s\n' "$C_BD" "$C_0"
+  if ! api_on; then printf '  state  : %sdisabled%s  (enable: erisbox api enable)\n' "$C_Y" "$C_0"; return 0; fi
+  printf '  state  : %s\n' "$(systemctl is-active erisbox-api 2>/dev/null)"
+  printf '  URL    : %s%s%s\n' "$C_BD" "$(api_url)" "$C_0"
+  printf '  allow  : %s\n' "${A_ALLOW:-from anywhere (a token is always required)}"
+  printf '  tokens : %s\n' "$(cut -d: -f1 "$API_TOKENS" 2>/dev/null | paste -sd' ' -)"
+  if [ "$A_TLS" = 1 ] && pin="$(api_pin)"; then
+    printf '  TLS    : self-signed or own certificate - pin it in your bot:\n'
+    printf '           %s\n' "$pin"
+    printf '  test   : curl -k --pinnedpubkey "%s" -H "Authorization: Bearer TOKEN" %s/plans\n' "$pin" "$(api_url)"
+  else
+    printf '  test   : curl -H "Authorization: Bearer TOKEN" %s/plans\n' "$(api_url)"
+  fi
+}
+
+api_token() {
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  parse_flags "$@"; need_root; need_installed
+  local name="${POS[0]:-}" tok hash perm=full tmp
+  touch "$API_TOKENS"; chmod 600 "$API_TOKENS"
+  case "$sub" in
+    list|ls)
+      [ -s "$API_TOKENS" ] || { echo "  (no tokens - add one: erisbox api token add bot)"; return 0; }
+      awk -F: '{printf "  %-20s %-10s created %s\n", $1, ($3=="read" ? "read-only" : "full"), $4}' "$API_TOKENS" ;;
+    add|new|create)
+      valid_name "$name" || die "usage: erisbox api token add NAME [--read-only]   (name: a-z, 0-9, -)"
+      grep -q "^$name:" "$API_TOKENS" && die "a token called $name already exists (delete it first)"
+      has_flag read-only && perm=read
+      tok="eb_$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)"
+      hash="$(printf '%s' "$tok" | sha256sum | cut -d' ' -f1)"
+      echo "$name:$hash:$perm:$(date +%F)" >> "$API_TOKENS"
+      log "api token $name added ($perm)"
+      ok "API token '$name' ($( [ "$perm" = read ] && echo read-only || echo full access)) - copy it now, it is not shown again:"
+      echo "TOKEN: $tok" ;;
+    del|delete|rm|remove)
+      grep -q "^$name:" "$API_TOKENS" 2>/dev/null || die "no token called '$name'"
+      tmp="$(mktemp)"; grep -v "^$name:" "$API_TOKENS" > "$tmp"; cat "$tmp" > "$API_TOKENS"; rm -f "$tmp"
+      log "api token $name deleted"
+      ok "token $name deleted" ;;
+    *) die "usage: erisbox api token list | add NAME [--read-only] | del NAME" ;;
+  esac
+}
+
+api_py() {
+  cat <<'PYEOF'
+#!/usr/bin/env python3
+"""Eris Box API - a small JSON API for selling bots.
+
+Every action runs the erisbox command with an argument list (never through a shell),
+so the API can do exactly what the command line can, with the same checks.
+"""
+import hashlib
+import hmac
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import ssl
+import subprocess
+import threading
+import time
+import traceback
+
+ETC = "/etc/erisbox"
+CONF = os.environ.get("ERISBOX_API_CONF", ETC + "/api.conf")
+TOKENS = os.environ.get("ERISBOX_API_TOKENS", ETC + "/api-tokens")
+LOG = os.environ.get("ERISBOX_API_LOG", "/var/lib/erisbox/logs/api.log")
+ERISBOX = os.environ.get("ERISBOX_BIN", "/usr/local/bin/erisbox")
+NAME = r"[a-z][a-z0-9-]{0,30}[a-z0-9]"
+MAX_BODY = 65536
+ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+class ApiError(Exception):
+    def __init__(self, status, code, msg):
+        super().__init__(msg)
+        self.status, self.code, self.msg = status, code, msg
+
+
+def read_kv(path):
+    data = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^([A-Z][A-Z0-9_]*)='([^']*)'$", line.rstrip("\n"))
+                if m:
+                    data[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return data
+
+
+CONFIG = read_kv(CONF)
+ALLOW = []
+for item in CONFIG.get("ALLOW", "").replace(" ", "").split(","):
+    if item:
+        ALLOW.append(ipaddress.ip_network(item, strict=False))
+
+
+def ip_allowed(ip):
+    if not ALLOW:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+    except ValueError:
+        return False
+    return any(addr in net for net in ALLOW)
+
+
+_tok_cache = {"mtime": None, "items": []}
+_tok_lock = threading.Lock()
+
+
+def tokens():
+    try:
+        mtime = os.stat(TOKENS).st_mtime
+    except OSError:
+        return []
+    with _tok_lock:
+        if mtime != _tok_cache["mtime"]:
+            items = []
+            with open(TOKENS, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 3 and re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+                        items.append((parts[0], parts[1], parts[2]))
+            _tok_cache.update(mtime=mtime, items=items)
+        return list(_tok_cache["items"])
+
+
+def check_token(tok):
+    if not tok:
+        return None
+    digest = hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()
+    found = None
+    for name, stored, perm in tokens():
+        if hmac.compare_digest(digest, stored):
+            found = (name, perm)
+    return found
+
+
+_fails = {}
+_fail_lock = threading.Lock()
+
+
+def blocked(ip):
+    with _fail_lock:
+        count, first = _fails.get(ip, (0, 0))
+        if time.time() - first > 900:
+            _fails.pop(ip, None)
+            return False
+        return count >= 10
+
+
+def note_fail(ip):
+    with _fail_lock:
+        count, first = _fails.get(ip, (0, time.time()))
+        if time.time() - first > 900:
+            count, first = 0, time.time()
+        _fails[ip] = (count + 1, first)
+
+
+def run(args, timeout=1800):
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "NO_COLOR": "1", "ERISBOX_YES": "1", "HOME": "/root", "LANG": "C.UTF-8"}
+    try:
+        p = subprocess.run([ERISBOX] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return 124, "", "[x] the command took too long"
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def error_from(out, err):
+    lines = (err + "\n" + out).splitlines()
+    marked = [l[4:].strip() for l in lines if l.startswith("[x] ")]
+    msg = marked[-1] if marked else next((l.strip() for l in reversed(lines) if l.strip()), "command failed")
+    low = msg.lower()
+    if "not found" in low or " has no " in low:
+        return ApiError(404, "not_found", msg)
+    if "server is full" in low or "not enough free disk" in low or "no free" in low:
+        return ApiError(409, "server_full", msg)
+    if "already" in low:
+        return ApiError(409, "conflict", msg)
+    if "not running" in low or "start the machine first" in low:
+        return ApiError(409, "not_running", msg)
+    if " is expired" in low or " is overquota" in low:
+        return ApiError(409, "blocked", msg)
+    return ApiError(400, "failed", msg)
+
+
+def call(args):
+    rc, out, err = run(args)
+    if rc != 0:
+        raise error_from(out, err)
+    return out
+
+
+def call_json(args):
+    out = call(args)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise ApiError(500, "bad_output", "erisbox returned invalid JSON")
+
+
+def val(v, field):
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return ("%.6f" % v).rstrip("0").rstrip(".")
+    if isinstance(v, str) and len(v) <= 300 and not re.search(r"[\x00-\x1f\x7f]", v):
+        return v
+    raise ApiError(400, "bad_value", "invalid value for '%s'" % field)
+
+
+def flags(body, mapping):
+    out = []
+    for field, flag in mapping:
+        if field in body and body[field] is not None:
+            out += [flag, val(body[field], field)]
+    return out
+
+
+CREATE = [("plan", "--plan"), ("os", "--os"), ("cpu", "--cpu"), ("ram", "--ram"), ("swap", "--swap"),
+          ("disk", "--disk"), ("pids", "--pids"), ("ssh_port", "--ssh-port"), ("ports", "--ports"),
+          ("password", "--password"), ("ssh_key", "--ssh-key"), ("speed", "--speed"), ("traffic", "--traffic"),
+          ("reset_day", "--reset-day"), ("expire", "--expire"), ("days", "--expire"), ("tun", "--tun")]
+CHANGE = [("cpu", "--cpu"), ("ram", "--ram"), ("swap", "--swap"), ("disk", "--disk"), ("pids", "--pids"),
+          ("speed", "--speed"), ("traffic", "--traffic"), ("reset_day", "--reset-day"), ("expire", "--expire"),
+          ("autostart", "--autostart"), ("tun", "--tun"), ("io_mbps", "--io-mbps"), ("io_iops", "--io-iops")]
+
+
+def machine(name):
+    return call_json(["info", name, "--json"])
+
+
+def do_create(body):
+    name = body.get("name")
+    auto = name is None
+    for _ in range(5):
+        if auto:
+            name = "u" + "".join(secrets.choice(ALNUM) for _ in range(7))
+        name = val(name, "name")
+        if not re.fullmatch(NAME, name):
+            raise ApiError(400, "bad_value", "name: 2-32 characters a-z, 0-9 and -, starting with a letter")
+        rc, out, err = run(["create", name, "--strict", "-y"] + flags(body, CREATE))
+        if rc == 0:
+            return machine(name)
+        e = error_from(out, err)
+        if auto and e.code == "conflict":
+            continue
+        raise e
+    raise ApiError(409, "conflict", "could not find a free name")
+
+
+JOBS = {}
+_jobs_lock = threading.Lock()
+
+
+def start_job(fn, *args):
+    jid = secrets.token_hex(8)
+    with _jobs_lock:
+        for k in [k for k, j in JOBS.items() if time.time() - j["started"] > 86400]:
+            del JOBS[k]
+        JOBS[jid] = {"status": "running", "started": time.time()}
+
+    def work():
+        try:
+            res = fn(*args)
+            upd = {"status": "done", "machine": res}
+        except ApiError as e:
+            upd = {"status": "failed", "error": e.msg, "code": e.code}
+        except Exception as e:  # noqa: BLE001 - report anything to the bot
+            upd = {"status": "failed", "error": str(e), "code": "internal"}
+        with _jobs_lock:
+            JOBS[jid].update(upd)
+
+    threading.Thread(target=work, daemon=True).start()
+    return jid
+
+
+def h_ping(body, m):
+    return 200, {"ok": True, "service": "eris-box"}
+
+
+def h_status(body, m):
+    return 200, {"ok": True, "resources": call_json(["resources", "--json"])}
+
+
+def h_resources(body, m):
+    return 200, {"ok": True, "resources": call_json(["resources", "--json"])}
+
+
+def h_os(body, m):
+    return 200, {"ok": True, "os": call_json(["image", "list", "--json"])}
+
+
+def h_plans(body, m):
+    return 200, {"ok": True, "plans": call_json(["plan", "list", "--json"])}
+
+
+def h_list(body, m):
+    return 200, {"ok": True, "machines": call_json(["list", "--json"])}
+
+
+def h_create(body, m):
+    if body.get("async"):
+        return 202, {"ok": True, "job": start_job(do_create, body), "status": "running"}
+    return 201, {"ok": True, "machine": do_create(body)}
+
+
+def h_info(body, m):
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_change(body, m):
+    args = flags(body, CHANGE)
+    if not args:
+        raise ApiError(400, "bad_value", "nothing to change")
+    call(["set", m["name"], "-y"] + args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_delete(body, m):
+    call(["delete", m["name"], "-y"])
+    return 200, {"ok": True, "deleted": m["name"]}
+
+
+def h_power(body, m):
+    args = [m["action"], m["name"]]
+    if m["action"] != "stop" and body.get("force"):
+        args.append("--force")
+    call(args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_renew(body, m):
+    args = ["renew", m["name"], "-y"]
+    if "days" in body:
+        args.insert(2, val(body["days"], "days"))
+    elif "until" in body:
+        args.insert(2, val(body["until"], "until"))
+    elif "plan" in body:
+        args += ["--plan", val(body["plan"], "plan")]
+    if body.get("reset_traffic"):
+        args.append("--reset-traffic")
+    call(args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_password(body, m):
+    args = ["passwd", m["name"], "-y"]
+    if body.get("password") is not None:
+        args += ["--password", val(body["password"], "password")]
+    call(args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_reinstall(body, m):
+    args = ["reinstall", m["name"], "-y"] + flags(body, [("os", "--os"), ("password", "--password"), ("ssh_key", "--ssh-key")])
+    call(args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_traffic_reset(body, m):
+    call(["traffic", m["name"], "--reset", "-y"])
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_ip_add(body, m):
+    if "ip" not in body:
+        raise ApiError(400, "bad_value", "give the extra IPv4 as \"ip\"")
+    args = ["ip", "add", m["name"], val(body["ip"], "ip"), "-y"]
+    if body.get("force"):
+        args.append("--force")
+    call(args)
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_ip_del(body, m):
+    call(["ip", "del", m["name"], m["ip"], "-y"])
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_port_add(body, m):
+    if "port" not in body:
+        raise ApiError(400, "bad_value", "give \"port\": 8080, \"30000-30010\" or \"8080:80\"")
+    call(["port", "add", m["name"], val(body["port"], "port"), "--proto", val(body.get("proto", "both"), "proto"), "-y"])
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_port_del(body, m):
+    call(["port", "del", m["name"], m["port"], "-y"])
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
+def h_job(body, m):
+    with _jobs_lock:
+        job = dict(JOBS.get(m["job"], {}))
+    if not job:
+        raise ApiError(404, "not_found", "no such job (jobs are kept for 24 hours)")
+    job.pop("started", None)
+    return 200, dict(ok=True, job=m["job"], **job)
+
+
+M = "/api/v1/machines/(?P<name>" + NAME + ")"
+ROUTES = [
+    ("GET", "/api/v1/status", h_status, "read"),
+    ("GET", "/api/v1/resources", h_resources, "read"),
+    ("GET", "/api/v1/os", h_os, "read"),
+    ("GET", "/api/v1/plans", h_plans, "read"),
+    ("GET", "/api/v1/machines", h_list, "read"),
+    ("POST", "/api/v1/machines", h_create, "full"),
+    ("GET", M, h_info, "read"),
+    ("PATCH", M, h_change, "full"),
+    ("DELETE", M, h_delete, "full"),
+    ("POST", M + "/(?P<action>start|stop|restart)", h_power, "full"),
+    ("POST", M + "/renew", h_renew, "full"),
+    ("POST", M + "/password", h_password, "full"),
+    ("POST", M + "/reinstall", h_reinstall, "full"),
+    ("POST", M + "/traffic/reset", h_traffic_reset, "full"),
+    ("POST", M + "/ips", h_ip_add, "full"),
+    ("DELETE", M + r"/ips/(?P<ip>[0-9]{1,3}(\.[0-9]{1,3}){3})", h_ip_del, "full"),
+    ("POST", M + "/ports", h_port_add, "full"),
+    ("DELETE", M + "/ports/(?P<port>[0-9]{1,5})", h_port_del, "full"),
+    ("GET", "/api/v1/jobs/(?P<job>[0-9a-f]{16})", h_job, "read"),
+]
+ROUTES = [(meth, re.compile("^" + pat + "/?$"), fn, need) for meth, pat, fn, need in ROUTES]
+
+_log_lock = threading.Lock()
+
+
+def log(line):
+    try:
+        with _log_lock, open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except OSError:
+        pass
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "ErisBox"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+    timeout = 60
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send_json(self, status, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_any(self, method):
+        ip = self.client_address[0]
+        path = self.path.split("?", 1)[0]
+        who = "-"
+        try:
+            if not ip_allowed(ip):
+                self.close_connection = True
+                raise ApiError(403, "forbidden", "this IP may not use the API")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > MAX_BODY:
+                self.close_connection = True
+                raise ApiError(413, "too_large", "request body is too large")
+            raw = self.rfile.read(length) if length else b""
+            body = {}
+            if raw.strip():
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    raise ApiError(400, "bad_json", "the body must be JSON")
+                if not isinstance(body, dict):
+                    raise ApiError(400, "bad_json", "the body must be a JSON object")
+            if method == "GET" and re.fullmatch(r"/api/v1/ping/?", path):
+                status, result = h_ping(body, {})
+            else:
+                if blocked(ip):
+                    raise ApiError(429, "too_many_attempts", "too many wrong tokens - wait 15 minutes")
+                auth = self.headers.get("Authorization", "")
+                tok = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("X-API-Key", "").strip()
+                found = check_token(tok)
+                if not found:
+                    note_fail(ip)
+                    raise ApiError(401, "unauthorized", "missing or wrong API token")
+                who, perm = found
+                route, match = None, None
+                for meth, rx, fn, need in ROUTES:
+                    mm = rx.match(path)
+                    if mm:
+                        if meth == method:
+                            route, match = (fn, need), mm
+                            break
+                        route = route or "method"
+                if route is None:
+                    raise ApiError(404, "not_found", "unknown API path")
+                if route == "method":
+                    raise ApiError(405, "method_not_allowed", "wrong HTTP method for this path")
+                fn, need = route
+                if need == "full" and perm != "full":
+                    raise ApiError(403, "read_only", "this token is read-only")
+                status, result = fn(body, match.groupdict())
+        except ApiError as e:
+            status, result = e.status, {"ok": False, "error": e.msg, "code": e.code}
+        except Exception:  # noqa: BLE001
+            log("ERROR " + traceback.format_exc().replace("\n", " | "))
+            status, result = 500, {"ok": False, "error": "internal error", "code": "internal"}
+        self.send_json(status, result)
+        log("%s %s %s %s %s" % (ip, who, method, path, status))
+
+    def do_GET(self):
+        self.handle_any("GET")
+
+    def do_POST(self):
+        self.handle_any("POST")
+
+    def do_PATCH(self):
+        self.handle_any("PATCH")
+
+    def do_DELETE(self):
+        self.handle_any("DELETE")
+
+    def do_PUT(self):
+        self.handle_any("PUT")
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass  # broken connections and failed TLS handshakes are not interesting
+
+
+def main():
+    port = int(CONFIG.get("PORT", "9443"))
+    httpd = Server((CONFIG.get("BIND", "0.0.0.0"), port), Handler)
+    if CONFIG.get("TLS", "1") == "1":
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(CONFIG.get("CERT", ETC + "/api/cert.pem"), CONFIG.get("KEY", ETC + "/api/key.pem"))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    log("API listening on port %d (tls=%s)" % (port, CONFIG.get("TLS", "1")))
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
 }
 # warnings when a new or changed machine would oversell the server (needs res_compute without it)
 oversell_warn() { # cpu ram swap
@@ -2402,9 +3280,20 @@ cmd_status() {
 
 cmd_image() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local sub="${POS[0]:-list}" os="${POS[1]:-}" f
+  local sub="${POS[0]:-list}" os="${POS[1]:-}" f first=1
   case "$sub" in
     list|ls)
+      if has_flag json; then
+        printf '['
+        for os in $OS_LIST; do
+          [ "$first" = 1 ] || printf ','
+          first=0
+          printf '{"os":%s,"label":%s,"ready":%s}' "$(json_str "$os")" "$(json_str "$(os_label "$os")")" \
+            "$( [ -s "$CACHE_DIR/$os.tar.zst" ] && echo true || echo false)"
+        done
+        printf ']\n'
+        return 0
+      fi
       for os in $OS_LIST; do
         f="$CACHE_DIR/$os.tar.zst"
         if [ -f "$f" ]; then printf '  %-14s %-8s ready, built %s\n' "$os" "$(human "$(stat -c %s "$f")")" "$(date -r "$f" +%F)"
@@ -2441,6 +3330,7 @@ setting_set() {
     DEF_PIDS) valid_int "$v" && [ "$v" -ge 64 ] || die "at least 64" ;;
     BLOCK_SMTP|BLOCK_PRIVATE) [[ "$v" =~ ^[01]$ ]] || die "0 or 1" ;;
     QUOTA_ACTION) [ "$v" = stop ] || [ "$v" = throttle ] || die "stop or throttle" ;;
+    SELL_MAX_RAM_PCT|SELL_MAX_CPU_PCT) valid_int "$v" && [ "$v" -le 10000 ] || die "a percentage (0 = no limit)" ;;
     UBUNTU_MIRROR|UBUNTU_PORTS_MIRROR|DEBIAN_MIRROR) valid_url "$v" || die "invalid URL" ;;
     *) die "unknown or read-only setting '$k'" ;;
   esac
@@ -2497,7 +3387,8 @@ cmd_uninstall() {
     if [ "$purge" = 1 ] && [ -f "$LXC_DIR/$n/config" ] && grep -q "^$LXC_MARK" "$LXC_DIR/$n/config"; then rm -rf "${LXC_DIR:?}/$n"; fi
   done
   G_NAME=""
-  systemctl disable --now erisbox-tick.timer >/dev/null 2>&1
+  systemctl disable --now erisbox-tick.timer erisbox-api.service >/dev/null 2>&1
+  rm -f "$UNIT_DIR/erisbox-api.service"
   systemctl disable erisbox-net.service >/dev/null 2>&1
   rm -f "$UNIT_DIR/erisbox-net.service" "$UNIT_DIR/erisbox-tick.service" "$UNIT_DIR/erisbox-tick.timer"
   systemctl daemon-reload
@@ -2645,6 +3536,9 @@ menu_main() {
    ${C_BD}Network${C_0}
      4) Dedicated IPs
      5) Domain proxy (websites on ports 80/443)
+   ${C_BD}Selling${C_0}
+    12) Sales plans
+    13) API for selling bots
    ${C_BD}Server${C_0}
      6) Server resources and usage (cores, RAM, disk: total / given / free)
      7) Backups
@@ -2668,7 +3562,70 @@ EOF
       9) run_action cmd_install ;;
       10) ( cmd_update ) && exec "$BIN_PATH" menu; pause ;;
       11) run_action cmd_uninstall; [ -x "$BIN_PATH" ] || exit 0 ;;
+      12) menu_plans ;;
+      13) menu_api ;;
       0|q|exit) exit 0 ;;
+    esac
+  done
+}
+
+menu_plans() {
+  local c
+  while true; do
+    printf '\n  %sSales plans%s (what a bot or "create --plan" sells)\n\n' "$C_BD" "$C_0"
+    ( cmd_plan list )
+    printf '\n     1) Add or edit a plan\n     2) Delete a plan\n     0) Back\n\n'
+    ask c "Choose" ""
+    case "$c" in
+      1) (
+           local n t os cpu ram swap disk days tr sp pt
+           s_load
+           ask n "Plan name (a-z, 0-9, -), e.g. small" ""
+           valid_name "$n" || die "invalid name"
+           pl_reset; PL_TITLE="$n"; pl_exists "$n" && pl_load "$n"
+           res_compute; res_show; echo
+           ask t "Title shown to buyers" "$PL_TITLE"
+           ask os "OS ($OS_LIST)" "$PL_OS"
+           ask cpu "CPU cores" "$PL_CPU"; ask ram "RAM" "$PL_RAM"; ask swap "Swap" "$PL_SWAP"; ask disk "Disk" "$PL_DISK"
+           ask days "Days per period (0 = never expires)" "$PL_DAYS"
+           ask tr "Monthly traffic in GB (0 = unlimited)" "$PL_TRAFFIC_GB"
+           ask sp "Speed limit in Mbit/s (0 = none)" "$PL_SPEED"
+           ask pt "Extra ports per machine (0 = none)" "$PL_PORTS"
+           [ "$pt" = 0 ] && pt=none
+           cmd_plan add "$n" --title "$t" --os "$os" --cpu "$cpu" --ram "$ram" --swap "$swap" --disk "$disk" \
+             --days "$days" --traffic "$tr" --speed "$sp" --ports "$pt"
+         ); pause ;;
+      2) ( local n; ask n "Plan to delete" ""; cmd_plan del "$n" ); pause ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+menu_api() {
+  local c
+  while true; do
+    ( s_load; a_load; api_status )
+    printf '\n     1) Enable / reconfigure the API\n     2) New token\n     3) List tokens\n     4) Delete a token\n     5) Allow only some IPs (your bot server)\n     6) Disable the API\n     0) Back\n\n'
+    ask c "Choose" ""
+    case "$c" in
+      1) (
+           local p al
+           a_load
+           ask p "Port" "$A_PORT"
+           ask al "Allowed IPs, comma separated (any = everyone with a token)" "${A_ALLOW:-any}"
+           cmd_api enable --port "$p" --allow "$al"
+         ); pause ;;
+      2) (
+           local n ro
+           ask n "Token name, e.g. bot" ""
+           ask ro "Read-only? (y/n)" n
+           if [[ "$ro" =~ ^[Yy] ]]; then api_token add "$n" --read-only; else api_token add "$n"; fi
+         ); pause ;;
+      3) ( api_token list ); pause ;;
+      4) ( local n; ask n "Token to delete" ""; api_token del "$n" ); pause ;;
+      5) ( local al; ask al "Allowed IPs (comma separated) or any" "any"; cmd_api allow "$al" ); pause ;;
+      6) run_action cmd_api disable ;;
+      *) return 0 ;;
     esac
   done
 }
@@ -2948,6 +3905,15 @@ Network
   domain default-http|default-tls IP:PORT|none
   apply                               rebuild bridge, NAT and firewall rules
 
+Selling
+  plan list [--json] | plan add NAME [--title T] [--os OS] [--cpu] [--ram] [--swap] [--disk]
+       [--days 30] [--traffic GB] [--speed MBIT] [--ports N|none] | plan del NAME
+  create NAME --plan NAME             renew NAME [DAYS] (no DAYS = one period of its plan)
+  api enable [--port 9443] [--allow IP,IP/CIDR] [--no-tls | --cert F --key F]
+  api status | pin | allow IPs|any | disable | restart
+  api token add NAME [--read-only] | token list | token del NAME
+  info NAME --json | list --json | resources --json   (what the API returns)
+
 Server
   install [--swap SIZE | --no-swap] [--prebuild]
   resources                           server cores / RAM / swap / disk: total, given, free
@@ -2987,6 +3953,8 @@ main() {
     delete|remove|rm|destroy) cmd_delete "$@" ;;
     status|host|stats) cmd_status "$@" ;;
     resources|res|free) cmd_resources "$@" ;;
+    plan|plans) cmd_plan "$@" ;;
+    api) cmd_api "$@" ;;
     image|images) cmd_image "$@" ;;
     settings|config) cmd_settings "$@" ;;
     apply) cmd_apply "$@" ;;

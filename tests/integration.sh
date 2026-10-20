@@ -261,6 +261,77 @@ else
   check "deleted domain gets 404" retry 10 sh -c "[ \"\$(ip netns exec cli curl -s -o /dev/null --max-time 5 -w '%{http_code}' -H 'Host: site1.test' http://$HOSTIP/)\" = 404 ]"
 fi
 
+section "selling: plans + HTTPS API (called from another network like a bot)"
+check "plan add small" $EB plan add small --title "Small VPS" --os "$OS_A" --cpu 0.2 --ram 200M --swap 256M --disk 1G --ports 3 --days 30 --traffic 50 -y
+check "plan list --json" sh -c "$EB plan list --json | jq -e '.[0].name == \"small\" and .[0].available == true'"
+check "api enable" $EB api enable --port 9443 -y
+check "api service active" systemctl is-active erisbox-api
+TOKEN="$($EB api token add bot2 -y | awk '/^TOKEN:/{print $2}')"
+RO="$($EB api token add viewer --read-only -y | awk '/^TOKEN:/{print $2}')"
+PIN="$($EB api pin)"
+API="https://$HOSTIP:9443/api/v1"
+check "tokens issued" test -n "$TOKEN" -a -n "$RO"
+api() { # method path [json] [token] -> AS = HTTP status, AB = body
+  local data=() out
+  [ -n "${3:-}" ] && data=(--data "$3")
+  out="$(ip netns exec cli curl -sk --pinnedpubkey "$PIN" --max-time 900 -X "$1" -H "Authorization: Bearer ${4:-$TOKEN}" \
+    -H 'Content-Type: application/json' "${data[@]}" -w '\n%{http_code}' "$API$2")"
+  AS="${out##*$'\n'}"; AB="${out%$'\n'*}"
+}
+api_check() { # description status jq-filter method path [json] [token]
+  local d="$1" st="$2" f="$3"; shift 3
+  api "$@"
+  if [ "$AS" = "$st" ] && jq -e "$f" <<<"$AB" >/dev/null 2>&1; then pass "$d"; else fail "$d"; echo "          got $AS: ${AB:0:400}"; fi
+}
+check "ping over TLS with the pinned key" sh -c "ip netns exec cli curl -sk --pinnedpubkey '$PIN' '$API/ping' | jq -e .ok"
+check "a wrong pin is refused" not ip netns exec cli curl -sk --pinnedpubkey "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" "$API/ping"
+api_check "wrong token -> 401" 401 '.code == "unauthorized"' GET /plans "" wrong-token
+api_check "resources" 200 '.resources.cpus > 0' GET /resources
+api_check "plans" 200 '.plans[0].name == "small"' GET /plans
+api_check "os list" 200 '.os | length > 0' GET /os
+api_check "read-only token cannot create" 403 '.code == "read_only"' POST /machines '{"plan":"small"}' "$RO"
+APW='api: pass "1" ü'
+api_check "create from plan" 201 '.machine.name == "apibox" and .machine.plan == "small" and .machine.ssh_port > 0 and (.machine.text_fa | contains("root"))' \
+  POST /machines "$(jq -cn --arg pw "$APW" '{plan:"small", name:"apibox", password:$pw}')"
+APORT_SSH="$(jq -r .machine.ssh_port <<<"$AB")"
+check "apibox running" retry 30 running apibox
+check "apibox has the plan's RAM" eq "$(cgv apibox memory.max)" 209715200
+check "apibox expires in 30 days" eq "$(conf apibox EXPIRE)" "$(date -d '+30 days' +%F)"
+check "SSH login with what the API returned" retry 60 sh -c "[ \"\$(ip netns exec cli sshpass -p '$APW' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p $APORT_SSH root@$HOSTIP hostname)\" = apibox ]"
+api_check "renew 10 days" 200 ".machine.expire == \"$(date -d '+40 days' +%F)\"" POST /machines/apibox/renew '{"days":10}'
+api_check "renew one plan period" 200 ".machine.expire == \"$(date -d '+70 days' +%F)\"" POST /machines/apibox/renew '{"reset_traffic":true}'
+api_check "new password" 200 '.machine.password == "new pass ;)"' POST /machines/apibox/password '{"password":"new pass ;)"}'
+check "login with the new password" retry 10 eq "$(ip netns exec cli sshpass -p 'new pass ;)' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$APORT_SSH" root@$HOSTIP hostname)" apibox
+api_check "random password" 200 '.machine.password | length >= 12' POST /machines/apibox/password '{}'
+api_check "stop" 200 '.machine.state == "STOPPED"' POST /machines/apibox/stop
+api_check "start" 200 '.machine.state == "RUNNING"' POST /machines/apibox/start
+api_check "change RAM" 200 '.machine.ram == "300M"' PATCH /machines/apibox '{"ram":"300M"}'
+check "RAM changed live" eq "$(cgv apibox memory.max)" 314572800
+api_check "list" 200 '[.machines[].name] | index("apibox") != null' GET /machines
+api_check "unknown machine" 404 '.code == "not_found"' GET /machines/nope
+api_check "unknown plan" 404 '.code == "not_found"' POST /machines '{"plan":"nope"}'
+api_check "name taken" 409 '.code == "conflict"' POST /machines '{"plan":"small","name":"apibox"}'
+$EB settings set SELL_MAX_RAM_PCT 1 >/dev/null
+api_check "sale limit reached -> server_full" 409 '.code == "server_full"' POST /machines '{"plan":"small"}'
+check "plan shows unavailable" sh -c "$EB plan list --json | jq -e '.[0].available == false'"
+$EB settings set SELL_MAX_RAM_PCT 150 >/dev/null
+api_check "async create" 202 '.status == "running"' POST /machines '{"plan":"small","async":true}'
+JOB="$(jq -r .job <<<"$AB")"
+for _ in $(seq 1 120); do api GET "/jobs/$JOB"; jq -e '.status != "running"' <<<"$AB" >/dev/null 2>&1 && break; sleep 3; done
+check "async job done" jq -e '.status == "done" and (.machine.name | startswith("u"))' <<<"$AB"
+JOBNAME="$(jq -r .machine.name <<<"$AB")"
+api_check "delete the async machine" 200 ".deleted == \"$JOBNAME\"" DELETE "/machines/$JOBNAME"
+api_check "delete apibox" 200 '.deleted == "apibox"' DELETE /machines/apibox
+api_check "apibox is gone" 404 '.code == "not_found"' GET /machines/apibox
+check "allow only another IP" $EB api allow 192.0.2.99 -y
+sleep 2
+check "other IPs get 403" retry 10 sh -c "ip netns exec cli curl -sk --pinnedpubkey '$PIN' -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer $TOKEN' '$API/plans' | grep -q 403"
+check "allow any again" $EB api allow any -y
+retry 10 sh -c "ip netns exec cli curl -sk --pinnedpubkey '$PIN' '$API/ping' | grep -q true"
+api_check "works again" 200 '.ok' GET /plans
+check "delete the read-only token" $EB api token del viewer -y
+api_check "deleted token -> 401" 401 '.code == "unauthorized"' GET /plans "" "$RO"
+
 section "traffic, quota, expiry (5-minute housekeeping)"
 check "tick runs" $EB _tick
 check "traffic counted for t1" sh -c "read a b c d < /var/lib/erisbox/traffic/t1; [ \$((a + b)) -gt 100000 ]"
@@ -350,6 +421,7 @@ check "routing rules removed" not sh -c "ip rule | grep -q '^31000:'"
 check "extra IP removed from $WAN" not sh -c "ip -4 addr show dev $WAN | grep -q 198.51.100.77"
 check "containers removed" not test -e /var/lib/lxc/t1
 check "command removed" not test -e $EB
+check "API service removed" not systemctl is-enabled erisbox-api
 check "data removed" not test -e /var/lib/erisbox
 
 echo

@@ -125,6 +125,20 @@ g_load legacy; eq "1.0 conf with a plain PASSWORD still loads" "$G_PASSWORD" old
 rm -f "$GUEST_DIR/legacy.conf"
 T=$((T + 1)); [ "$(pw_hash "$WEIRD" | cut -c1-3)" = '$6$' ] || { echo "FAIL: pw_hash is not SHA-512 crypt"; FAILS=$((FAILS + 1)); }
 
+# JSON for the API stays valid with any password
+if command -v python3 >/dev/null 2>&1; then
+  g_load alpha
+  T=$((T + 1))
+  info_json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["password"]==sys.argv[1], d["password"]; assert d["name"]=="alpha"; assert d["ports"][0]["from"]==20001' "$WEIRD" \
+    || { echo "FAIL: info_json is not valid JSON or loses the password"; FAILS=$((FAILS + 1)); }
+  T=$((T + 1))
+  list_json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert [m["name"] for m in d]==["alpha","beta"]' \
+    || { echo "FAIL: list_json"; FAILS=$((FAILS + 1)); }
+  T=$((T + 1))
+  [ "$(json_str $'a"b\\c\nd')" = '"a\"b\\c\nd"' ] || { echo "FAIL: json_str escaping"; FAILS=$((FAILS + 1)); }
+fi
+no valid_password $'tab\there'
+
 # login banner: valid sh, shows name + OS, never resource numbers
 banner_script > "$TMPD/banner.sh"
 yes sh -n "$TMPD/banner.sh"
@@ -171,6 +185,85 @@ no cpu_ok abc
 yes size_ok 200M 64M
 no size_ok 10M 64M
 no size_ok lots 64M
+
+# API server against a fake erisbox: auth, read-only tokens, routing, errors, lockout
+if command -v python3 >/dev/null 2>&1; then
+  api_py > "$TMPD/api.py"
+  T=$((T + 1)); python3 -m py_compile "$TMPD/api.py" || { echo "FAIL: api.py does not compile"; FAILS=$((FAILS + 1)); }
+  cat > "$TMPD/fake-erisbox" <<'EOF'
+#!/bin/bash
+case "$1" in
+  list) echo '[{"name":"alpha"}]' ;;
+  plan) echo '[{"name":"small","available":true}]' ;;
+  resources) echo '{"cpus":1}' ;;
+  info) if [ "$2" = nope ]; then echo "[x] machine 'nope' not found (see: erisbox list)" >&2; exit 1; fi
+        printf '{"name":"%s","password":"x"}\n' "$2" ;;
+  create) printf '%s\n' "$@" > "$FAKE_LOG"
+          [ "$2" = full ] && { echo "[x] server is full: RAM sale limit reached" >&2; exit 1; }
+          exit 0 ;;
+  *) echo "[x] unsupported in the fake" >&2; exit 1 ;;
+esac
+EOF
+  chmod +x "$TMPD/fake-erisbox"
+  APORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  printf "PORT='%s'\nTLS='0'\nBIND='127.0.0.1'\nALLOW=''\n" "$APORT" > "$TMPD/api.conf"
+  printf 'bot:%s:full:2026-01-01\nro:%s:read:2026-01-01\n' \
+    "$(printf 'eb_full' | sha256sum | cut -d' ' -f1)" "$(printf 'eb_read' | sha256sum | cut -d' ' -f1)" > "$TMPD/api-tokens"
+  ERISBOX_API_CONF="$TMPD/api.conf" ERISBOX_API_TOKENS="$TMPD/api-tokens" ERISBOX_API_LOG="$TMPD/api.log" \
+    ERISBOX_BIN="$TMPD/fake-erisbox" FAKE_LOG="$TMPD/create-args" python3 "$TMPD/api.py" &
+  APID=$!
+  for _ in $(seq 1 50); do python3 -c "import socket; socket.create_connection(('127.0.0.1',$APORT),1)" 2>/dev/null && break; sleep 0.1; done
+  cat > "$TMPD/client.py" <<'EOF'
+import json, sys, urllib.request, urllib.error
+base = "http://127.0.0.1:%s/api/v1" % sys.argv[1]
+argfile = sys.argv[2]
+fails = 0
+def req(method, path, body=None, token="eb_full", raw=None):
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    r = urllib.request.Request(base + path, data=data, method=method)
+    if token:
+        r.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+def check(name, got, want_status, test=lambda d: True):
+    global fails
+    st, d = got
+    if st != want_status or not test(d):
+        fails += 1
+        print("FAIL: api %s: got %s %s" % (name, st, d))
+check("ping", req("GET", "/ping", token=None), 200, lambda d: d["ok"])
+check("no token", req("GET", "/machines", token=None), 401, lambda d: d["code"] == "unauthorized")
+check("list", req("GET", "/machines"), 200, lambda d: d["machines"][0]["name"] == "alpha")
+check("plans", req("GET", "/plans"), 200, lambda d: d["plans"][0]["name"] == "small")
+check("info", req("GET", "/machines/alpha"), 200, lambda d: d["machine"]["password"] == "x")
+check("not found", req("GET", "/machines/nope"), 404, lambda d: d["code"] == "not_found")
+check("read-only create", req("POST", "/machines", {"plan": "small"}, token="eb_read"), 403, lambda d: d["code"] == "read_only")
+check("create", req("POST", "/machines", {"plan": "small", "name": "newbox", "password": 'a b"c', "cpu": 0.25, "tun": True}), 201,
+      lambda d: d["machine"]["name"] == "newbox")
+args = open(argfile).read().split("\n")
+for want in (["--plan", "small"], ["--password", 'a b"c'], ["--cpu", "0.25"], ["--tun", "on"], ["--strict"]):
+    if not all(w in args for w in want):
+        fails += 1
+        print("FAIL: api create args miss %s: %s" % (want, args))
+check("server full", req("POST", "/machines", {"name": "full"}), 409, lambda d: d["code"] == "server_full")
+check("bad value", req("POST", "/machines", {"cpu": {"x": 1}}), 400, lambda d: d["code"] == "bad_value")
+check("newline value", req("POST", "/machines", {"password": "a\nb"}), 400, lambda d: d["code"] == "bad_value")
+check("bad json", req("POST", "/machines", raw=b"{nope"), 400, lambda d: d["code"] == "bad_json")
+check("wrong method", req("PUT", "/machines"), 405, lambda d: d["code"] == "method_not_allowed")
+check("unknown path", req("GET", "/nothing"), 404)
+check("bad name in path", req("GET", "/machines/../etc"), 404)
+for _ in range(10):
+    req("GET", "/machines", token="wrong")
+check("lockout after 10 wrong tokens", req("GET", "/machines", token="eb_full"), 429, lambda d: d["code"] == "too_many_attempts")
+sys.exit(1 if fails else 0)
+EOF
+  T=$((T + 1))
+  python3 "$TMPD/client.py" "$APORT" "$TMPD/create-args" || { echo "FAIL: API checks (see above)"; FAILS=$((FAILS + 1)); }
+  kill "$APID" 2>/dev/null; wait "$APID" 2>/dev/null
+fi
 
 RULES="$(S_PROXY_ENABLED=1; nft_render eth0)"
 for want in 'tcp dport 2201 dnat to 10.88.0.11:22' 'tcp dport 20001-20010 dnat to 10.88.0.11' \
