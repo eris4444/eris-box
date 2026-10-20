@@ -58,6 +58,8 @@ yes valid_sshkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKey user@host"
 no valid_sshkey "not a key"
 yes valid_url http://archive.ubuntu.com/ubuntu
 no valid_url "ftp://x"
+for v in eth0 ens4 enp0s3 eth0.100 veth@if2; do yes valid_iface "$v"; done
+for v in ../../etc "a/b" "" .. "eth 0" abcdefghijklmnop; do no valid_iface "$v"; done
 
 port_spec 8080;        eq "port_spec 8080" "$P_HS $P_HE $P_GS" "8080 8080 8080"
 port_spec 30000-30010; eq "port_spec range" "$P_HS $P_HE $P_GS" "30000 30010 30000"

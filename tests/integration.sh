@@ -107,9 +107,8 @@ check "memory.swap.max = 1G" eq "$(cgv t1 memory.swap.max)" 1073741824
 check "pids.max = 512" eq "$(cgv t1 pids.max)" 512
 check "free shows ~200M RAM inside (lxcfs)" between "$(inside t1 free -m | awk '/^Mem:/{print $2}')" 150 210
 echo "  INFO  'free' inside shows swap total: $(inside t1 free -m | awk '/^Swap:/{print $2}') MB (the real limit is checked below)"
-echo "  INFO  lxcfs: $(lxcfs --version 2>&1 | head -1); $(systemctl cat lxcfs 2>/dev/null | grep '^ExecStart=' | tail -1)"
-lxcfs --help 2>&1 | grep -i -E 'swap|cfs' | sed 's/^/          lxcfs option: /'
-inside t1 grep -E '^(MemTotal|SwapTotal|SwapFree):' /proc/meminfo | sed 's/^/          inside: /'
+echo "  INFO  host: swappiness $(cat /proc/sys/vm/swappiness), kernel $(uname -r), swap: $(swapon --show --noheadings | tr '\n' ' ')"
+check "memory.high = 90% of RAM" eq "$(cgv t1 memory.high)" $((209715200 / 10 * 9))
 check "df shows ~2G disk inside" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 1700 2100
 check "hostname inside" eq "$(inside t1 hostname)" t1
 check "login message shows the plan" inside t1 grep -q 'RAM 200M | swap 1G | disk 2G' /etc/motd
@@ -132,12 +131,13 @@ U1="$(cgv t1 cpu.stat | awk '/^usage_usec/{print $2}')"
 check "CPU limit: 5 s busy loop uses <= ~1.3 s CPU" between "$(( (U1 - U0) / 1000 ))" 400 1300
 # (OOMScoreAdjust: CI runners give their processes unusual OOM priorities - make the hogs the obvious victims)
 inside t1 systemd-run --unit=memhog -p OOMScoreAdjust=1000 python3 -c "x=b'a'*(450<<20); import time; time.sleep(60)" >/dev/null 2>&1
-sleep 12
-check "450M program spills into swap" between "$(( $(cgv t1 memory.swap.current) / 1048576 ))" 150 1024
+check "450M program spills into swap" retry 40 sh -c "[ \$(( \$(lxc-cgroup -n t1 memory.swap.current) / 1048576 )) -ge 150 ]"
+echo "  INFO  swap used by t1: $(( $(cgv t1 memory.swap.current) / 1048576 )) MB, RAM $(( $(cgv t1 memory.current) / 1048576 )) MB"
 check "RAM stays within 200M" between "$(( $(cgv t1 memory.current) / 1048576 ))" 1 205
 inside t1 systemctl stop memhog >/dev/null 2>&1
 OOM0="$(cgv t1 memory.events | awk '/^oom_kill /{print $2}')"
-check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 sh -c 'echo 1000 > /proc/self/oom_score_adj; exec python3 -c "x=bytes(1)*(1400<<20)"'
+check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 timeout 240 systemd-run --wait --quiet -p OOMScoreAdjust=1000 python3 -c "x=bytes(1)*(1400<<20)"
+sleep 3
 check "the machine survives the OOM kill" running t1
 check "oom_kill counted" sh -c "[ \$(lxc-cgroup -n t1 memory.events | awk '/^oom_kill /{print \$2}') -gt ${OOM0:-0} ]"
 check "disk limit: cannot write 2.6G" not inside t1 dd if=/dev/zero of=/fill bs=1M count=2600 status=none
@@ -288,6 +288,10 @@ check "delete t2" $EB delete t2 -y
 check "t2 config gone" not test -e /etc/erisbox/guests/t2.conf
 check "t2 disk gone" not test -e /var/lib/erisbox/disks/t2.img
 check "t2 LXC container gone" not test -e /var/lib/lxc/t2
+mkdir -p /tmp/evil && ln -sf /etc/hostname /tmp/evil/evil.img && echo "OS='$OS_A'" > /tmp/evil/evil.conf
+tar -C /tmp/evil -cf - evil.img evil.conf | zstd -q > /tmp/evil.tar.zst
+check "restore refuses a backup whose disk is a symlink" not $EB restore /tmp/evil.tar.zst -y
+check "no machine was created from it" not test -e /etc/erisbox/guests/evil.conf
 check "restore as t3" $EB restore "$BK" t3 -y
 check "t3 running" retry 30 running t3
 check "t3 has t2's files" inside t3 test -e /root/marker

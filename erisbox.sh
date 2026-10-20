@@ -140,6 +140,7 @@ valid_num() { [[ "$1" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]]; }
 valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$(date -d "$1" +%F 2>/dev/null)" = "$1" ]; }
 valid_password() { [[ "$1" =~ ^[A-Za-z0-9._@%+=,!#^*-]{6,64}$ ]]; }
 valid_url() { [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; }
+valid_iface() { [[ "$1" =~ ^[A-Za-z0-9_.:@-]{1,15}$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
 valid_hostport() {
   [[ "$1" =~ ^([0-9.]+):([0-9]+)$ ]] || return 1
   local h="${BASH_REMATCH[1]}" p="${BASH_REMATCH[2]}"
@@ -535,8 +536,17 @@ EOF
 }
 
 write_sysctl() {
-  printf '# Eris Box: route traffic for the machines\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-erisbox.conf
-  sysctl -q -p /etc/sysctl.d/90-erisbox.conf >/dev/null 2>&1 || sysctl -qw net.ipv4.ip_forward=1
+  local f=/etc/sysctl.d/90-erisbox.conf swap_line=0
+  # with vm.swappiness=0 the kernel never swaps a cgroup, so the machines' swap would be useless
+  if [ "$(cat /proc/sys/vm/swappiness 2>/dev/null)" = 0 ] || grep -qs '^vm.swappiness' "$f"; then
+    swap_line=1
+    [ "$(cat /proc/sys/vm/swappiness 2>/dev/null)" = 0 ] && warn "vm.swappiness was 0 (machines could never use swap) - set to 10"
+  fi
+  {
+    printf '# Eris Box: route traffic for the machines\nnet.ipv4.ip_forward = 1\n'
+    [ "$swap_line" = 1 ] && printf '# let the machines use their swap\nvm.swappiness = 10\n'
+  } > "$f"
+  sysctl -q -p "$f" >/dev/null 2>&1 || sysctl -qw net.ipv4.ip_forward=1
 }
 
 swap_setup() {
@@ -831,6 +841,9 @@ io_value() { # "MAJ:MIN rbps=.. wbps=.. riops=.. wiops=.." for the loaded machin
   echo "$dev rbps=$bps wbps=$bps riops=$iops wiops=$iops"
 }
 
+# soft limit at 90% of RAM: the kernel starts pushing the machine into swap before the hard limit
+mem_high() { echo $(( $(to_bytes "$G_RAM") / 10 * 9 )); }
+
 lxc_write_config() {
   local d="$LXC_DIR/$G_NAME" b wan mtu iov
   b="$(g_base)"; wan="$(wan_if)"
@@ -864,6 +877,7 @@ lxc_write_config() {
     echo "lxc.hook.post-stop = $LIB_DIR/hook-poststop"
     echo "lxc.cgroup2.cpu.max = $(cpu_quota "$G_CPU") 100000"
     echo "lxc.cgroup2.memory.max = $(to_bytes "$G_RAM")"
+    echo "lxc.cgroup2.memory.high = $(mem_high)"
     cg_supports memory.swap.max && echo "lxc.cgroup2.memory.swap.max = $(to_bytes "$G_SWAP")"
     echo "lxc.cgroup2.pids.max = $G_PIDS"
     if [ "${G_IO_MBPS:-0}" -gt 0 ] || [ "${G_IO_IOPS:-0}" -gt 0 ]; then
@@ -908,7 +922,10 @@ apply_live_limits() {
   local iov
   g_running "$G_NAME" || return 0
   lxc-cgroup -n "$G_NAME" cpu.max "$(cpu_quota "$G_CPU") 100000" || warn "could not change CPU live"
+  # raise or lower in a safe order: high must never end up above max
+  lxc-cgroup -n "$G_NAME" memory.high max >/dev/null 2>&1
   lxc-cgroup -n "$G_NAME" memory.max "$(to_bytes "$G_RAM")" || warn "could not change RAM live"
+  lxc-cgroup -n "$G_NAME" memory.high "$(mem_high)" >/dev/null 2>&1
   if cg_supports memory.swap.max; then
     lxc-cgroup -n "$G_NAME" memory.swap.max "$(to_bytes "$G_SWAP")" || warn "could not change swap live"
   fi
@@ -1429,7 +1446,7 @@ ip_add() {
     fi
   fi
   has_flag gw && L_GW="$(flag gw)"
-  [ -e "/sys/class/net/$L_IFACE" ] || die "network card '$L_IFACE' does not exist"
+  valid_iface "$L_IFACE" && [ -e "/sys/class/net/$L_IFACE" ] || die "network card '$L_IFACE' does not exist"
   [ -z "$L_GW" ] || valid_ipv4 "$L_GW" || die "invalid gateway '$L_GW'"
   if [ "$L_ADDED" = 1 ]; then
     info "$pub is not configured on this server - adding it to $L_IFACE"
@@ -2094,14 +2111,22 @@ PY
 
 cmd_restore() {
   parse_flags "$@"; need_root; need_installed; s_load
-  local file="${POS[0]:-}" newname="${POS[1]:-}" tmpd conf img old name oldbase e v keep="" cnt
+  local file="${POS[0]:-}" newname="${POS[1]:-}" tmpd conf img old name oldbase e v keep="" cnt members
   [ -f "$file" ] || die "usage: erisbox restore BACKUP_FILE [NEW_NAME]   (backups are in $BACKUP_DIR)"
   take_lock
+  # a backup may come from somebody else: accept exactly NAME.img + NAME.conf as plain files
+  members="$(zstd -dc "$file" | tar -tf - 2>/dev/null)" || die "cannot read $file"
+  if [ "$(printf '%s\n' "$members" | grep -c .)" != 2 ] \
+     || printf '%s\n' "$members" | grep -qvE '^[a-z][a-z0-9-]{0,30}[a-z0-9]\.(img|conf)$'; then
+    die "$file is not an Eris Box backup"
+  fi
   tmpd="$(mktemp -d "$VAR_DIR/restore.XXXXXX")"
   info "Unpacking $file ..."
-  if ! zstd -dc "$file" | tar --sparse -xf - -C "$tmpd"; then rm -rf "$tmpd"; die "cannot read $file"; fi
-  conf="$(find "$tmpd" -maxdepth 1 -name '*.conf' | head -1)"; img="$(find "$tmpd" -maxdepth 1 -name '*.img' | head -1)"
-  if [ ! -f "$conf" ] || [ ! -f "$img" ]; then rm -rf "$tmpd"; die "$file is not an Eris Box backup"; fi
+  if ! zstd -dc "$file" | tar --sparse --no-same-owner -xf - -C "$tmpd"; then rm -rf "$tmpd"; die "cannot read $file"; fi
+  conf="$(find "$tmpd" -maxdepth 1 -type f -name '*.conf' | head -1)"; img="$(find "$tmpd" -maxdepth 1 -type f -name '*.img' | head -1)"
+  if [ ! -f "$conf" ] || [ ! -f "$img" ] || [ -L "$conf" ] || [ -L "$img" ] || [ -n "$(find "$tmpd" -mindepth 1 ! -type f)" ]; then
+    rm -rf "$tmpd"; die "$file is not an Eris Box backup"
+  fi
   old="$(basename "$conf" .conf)"; name="${newname:-$old}"
   if ! valid_name "$name" || g_exists "$name" || [ -e "$LXC_DIR/$name" ]; then
     rm -rf "$tmpd"; die "a machine called '$name' already exists here - give a new name: erisbox restore $file NEWNAME"
@@ -2111,6 +2136,11 @@ cmd_restore() {
      || ! to_bytes "$G_DISK" >/dev/null || ! valid_int "$G_PIDS" || ! valid_password "$G_PASSWORD"; then
     rm -rf "$tmpd"; die "the settings inside this backup are damaged"
   fi
+  if [ "$(cpu_quota "$G_CPU")" -gt $(( $(host_cpus) * 100000 )) ]; then
+    warn "the backup asks for $G_CPU CPU - limited to this server's $(host_cpus)"; G_CPU="$(host_cpus)"
+  fi
+  [ "$(cpu_quota "$G_CPU")" -ge 1000 ] || G_CPU=0.01
+  [ "$G_PIDS" -ge 64 ] || G_PIDS=64
   for e in IO_MBPS IO_IOPS SPEED RESET_DAY; do v="G_$e"; valid_int "${!v}" || printf -v "$v" '%s' 0; done
   valid_num "$G_TRAFFIC_GB" || G_TRAFFIC_GB=0
   [ "$G_TUN" = 1 ] || G_TUN=0
@@ -2331,7 +2361,8 @@ cmd_uninstall() {
   rm -rf "$LIB_DIR"
   rm -f /etc/sysctl.d/90-erisbox.conf
   if [ "$purge" = 1 ]; then
-    rm -rf "$ETC_DIR" "$VAR_DIR"
+    umount_below "$VAR_DIR"
+    rm -rf --one-file-system "$ETC_DIR" "$VAR_DIR"
     sed -i "/^root:${SUBUID_START}:${SUBUID_COUNT}\$/d" /etc/subuid /etc/subgid
     ok "Eris Box and all machines were removed"
   else
