@@ -198,7 +198,7 @@ case "$1" in
   resources) echo '{"cpus":1}' ;;
   info) if [ "$2" = nope ]; then echo "[x] machine 'nope' not found (see: erisbox list)" >&2; exit 1; fi
         printf '{"name":"%s","password":"x"}\n' "$2" ;;
-  create) printf '%s\n' "$@" > "$FAKE_LOG"
+  create) printf '%s\n' "$@" > "$(dirname "$0")/create-args"   # (the API passes a clean environment)
           [ "$2" = full ] && { echo "[x] server is full: RAM sale limit reached" >&2; exit 1; }
           exit 0 ;;
   *) echo "[x] unsupported in the fake" >&2; exit 1 ;;
@@ -210,7 +210,7 @@ EOF
   printf 'bot:%s:full:2026-01-01\nro:%s:read:2026-01-01\n' \
     "$(printf 'eb_full' | sha256sum | cut -d' ' -f1)" "$(printf 'eb_read' | sha256sum | cut -d' ' -f1)" > "$TMPD/api-tokens"
   ERISBOX_API_CONF="$TMPD/api.conf" ERISBOX_API_TOKENS="$TMPD/api-tokens" ERISBOX_API_LOG="$TMPD/api.log" \
-    ERISBOX_BIN="$TMPD/fake-erisbox" FAKE_LOG="$TMPD/create-args" python3 "$TMPD/api.py" &
+    ERISBOX_BIN="$TMPD/fake-erisbox" python3 "$TMPD/api.py" &
   APID=$!
   for _ in $(seq 1 50); do python3 -c "import socket; socket.create_connection(('127.0.0.1',$APORT),1)" 2>/dev/null && break; sleep 0.1; done
   cat > "$TMPD/client.py" <<'EOF'
