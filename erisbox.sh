@@ -741,7 +741,7 @@ guest_setup_files() {
   printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$G_NAME" | gwrite etc/hosts 644
   for t in $S_DNS; do echo "nameserver $t"; done | gwrite etc/resolv.conf 644
   printf '%s\n' "$(tr -d -- '-\n' </proc/sys/kernel/random/uuid)" | gwrite etc/machine-id 444
-  printf '\n  Welcome to %s (an Eris Box machine).\n  See your limits with: nproc, free -h, df -h /\n\n' "$G_NAME" | gwrite etc/motd 644
+  motd_text | gwrite etc/motd 644
   for t in rsa ecdsa ed25519; do
     rm -f "$m/etc/ssh/ssh_host_${t}_key" "$m/etc/ssh/ssh_host_${t}_key.pub"
     ssh-keygen -q -t "$t" -N '' -C "root@$G_NAME" -f "$m/etc/ssh/ssh_host_${t}_key" </dev/null >/dev/null \
@@ -758,6 +758,21 @@ guest_setup_files() {
     rm -rf "$m/root/.ssh"; mkdir -m 700 "$m/root/.ssh"; chown "$b:$b" "$m/root/.ssh"
     printf '%s\n' "$key" | gwrite root/.ssh/authorized_keys 600
   fi
+  return 0
+}
+
+# login message with the machine's plan ("free" inside shows 0 swap with Ubuntu's lxcfs 5.0)
+motd_text() {
+  printf '\n  Welcome to %s (an Eris Box machine)\n\n' "$G_NAME"
+  printf '  Your plan : CPU %s core | RAM %s | swap %s | disk %s | max %s processes\n' "$G_CPU" "$G_RAM" "$G_SWAP" "$G_DISK" "$G_PIDS"
+  [ "${G_SPEED:-0}" != 0 ] && printf '  Speed     : %s Mbit/s\n' "$G_SPEED"
+  [ "${G_TRAFFIC_GB:-0}" != 0 ] && printf '  Traffic   : %s GB per month\n' "$G_TRAFFIC_GB"
+  [ -n "$G_EXPIRE" ] && printf '  Valid until %s\n' "$G_EXPIRE"
+  printf '  (free -h may show 0 swap here - your swap limit still applies)\n\n'
+}
+guest_motd_update() { # refresh /etc/motd inside a running machine (best effort)
+  g_running "$G_NAME" || return 0
+  motd_text | guest_exec "$G_NAME" sh -c 'cat > /etc/motd' >/dev/null 2>&1
   return 0
 }
 
@@ -1913,6 +1928,7 @@ cmd_set() {
   if [ -n "$G_NOTE" ]; then enforce_note
   elif [ "$start" = 1 ] && [ "$G_AUTOSTART" = 1 ]; then guest_start
   fi
+  guest_motd_update
   log "set $name $*"
   ok "updated $name"
   [ "$restart" = 1 ] && g_running "$name" && warn "restart $name to apply the TUN change: erisbox restart $name"
@@ -1940,6 +1956,7 @@ cmd_renew() {
   g_save; lxc_write_config
   [ -z "$G_NOTE" ] && [ "$G_AUTOSTART" = 1 ] && guest_start
   tc_apply
+  guest_motd_update
   log "renew $name until $G_EXPIRE"
   ok "$name is valid until $G_EXPIRE"
 }

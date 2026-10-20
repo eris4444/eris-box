@@ -57,8 +57,9 @@ You get everything you need to send to the user:
   Ports      : 1.2.3.4:20001-20010 (tcp+udp, same numbers inside)
 ```
 
-Inside the machine, `free -h` and `df -h /` show the machine's own RAM, swap and disk,
-not the whole server's.
+Inside the machine, `free -h` and `df -h /` show the machine's own RAM and disk, not the
+whole server's, and the login message shows its plan. (With the lxcfs version in Ubuntu
+22.04/24.04, `free` shows 0 swap. The machine can still use its full swap allowance.)
 
 ## Features
 

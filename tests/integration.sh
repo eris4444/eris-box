@@ -112,6 +112,7 @@ lxcfs --help 2>&1 | grep -i -E 'swap|cfs' | sed 's/^/          lxcfs option: /'
 inside t1 grep -E '^(MemTotal|SwapTotal|SwapFree):' /proc/meminfo | sed 's/^/          inside: /'
 check "df shows ~2G disk inside" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 1700 2100
 check "hostname inside" eq "$(inside t1 hostname)" t1
+check "login message shows the plan" inside t1 grep -q 'RAM 200M | swap 1G | disk 2G' /etc/motd
 check "t1 reaches the internet" retry 30 inside t1 curl -fsS -o /dev/null --max-time 10 https://deb.debian.org/
 check "apt works inside t1" inside t1 sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null'
 check "SSH banner on $HOSTIP:$SSH1" retry 30 is_ssh banner cli "$HOSTIP" "$SSH1"
@@ -129,13 +130,15 @@ U0="$(cgv t1 cpu.stat | awk '/^usage_usec/{print $2}')"
 inside t1 timeout 5 sh -c 'while :; do :; done'
 U1="$(cgv t1 cpu.stat | awk '/^usage_usec/{print $2}')"
 check "CPU limit: 5 s busy loop uses <= ~1.3 s CPU" between "$(( (U1 - U0) / 1000 ))" 400 1300
-inside t1 systemd-run --unit=memhog python3 -c "x=b'a'*(450<<20); import time; time.sleep(60)" >/dev/null 2>&1
+# (OOMScoreAdjust: CI runners give their processes unusual OOM priorities - make the hogs the obvious victims)
+inside t1 systemd-run --unit=memhog -p OOMScoreAdjust=1000 python3 -c "x=b'a'*(450<<20); import time; time.sleep(60)" >/dev/null 2>&1
 sleep 12
 check "450M program spills into swap" between "$(( $(cgv t1 memory.swap.current) / 1048576 ))" 150 1024
 check "RAM stays within 200M" between "$(( $(cgv t1 memory.current) / 1048576 ))" 1 205
 inside t1 systemctl stop memhog >/dev/null 2>&1
 OOM0="$(cgv t1 memory.events | awk '/^oom_kill /{print $2}')"
-check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 python3 -c "x=b'a'*(1400<<20)"
+check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 sh -c 'echo 1000 > /proc/self/oom_score_adj; exec python3 -c "x=bytes(1)*(1400<<20)"'
+check "the machine survives the OOM kill" running t1
 check "oom_kill counted" sh -c "[ \$(lxc-cgroup -n t1 memory.events | awk '/^oom_kill /{print \$2}') -gt ${OOM0:-0} ]"
 check "disk limit: cannot write 2.6G" not inside t1 dd if=/dev/zero of=/fill bs=1M count=2600 status=none
 inside t1 rm -f /fill
@@ -148,6 +151,7 @@ check "cpu.max = 0.5" eq "$(cgv t1 cpu.max)" "50000 100000"
 check "memory.max = 300M" eq "$(cgv t1 memory.max)" 314572800
 check "memory.swap.max = 512M" eq "$(cgv t1 memory.swap.max)" 536870912
 check "disk grew online to ~3G" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 2700 3100
+check "login message follows the change" inside t1 grep -q 'RAM 300M | swap 512M | disk 3G' /etc/motd
 check "set speed 8 Mbit" $EB set t1 --speed 8 -y
 check "tbf qdisc on ebx$ID1" sh -c "tc qdisc show dev ebx$ID1 | grep -q tbf"
 check "ingress policer on ebx$ID1" sh -c "tc filter show dev ebx$ID1 ingress | grep -q police"
