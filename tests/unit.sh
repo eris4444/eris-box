@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # the globals set here are read by the sourced erisbox.sh functions
 # Fast unit tests for the helper functions of erisbox.sh.
 # Run: bash tests/unit.sh   (as root it also syntax-checks the generated nftables rules)
 cd "$(dirname "$0")/.." || exit 1

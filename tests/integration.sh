@@ -145,7 +145,7 @@ check "no qdisc left" not sh -c "tc qdisc show dev ebx$ID1 | grep -q tbf"
 
 section "create t2 ($OS_B, image built on demand)"
 check "create t2" $EB create t2 --os "$OS_B" --ports none --password Test-Pass-5678 -y
-ID2="$(conf t2 ID)"; IP2="$SUB.0.$((10 + ID2))"; SSH2="$(conf t2 SSH_PORT)"
+SSH2="$(conf t2 SSH_PORT)"
 check "t2 running" running t2
 check "t2 booted" retry 90 booted t2
 check "t2 is $OS_B" inside t2 grep -q "ID=${OS_B%%-*}" /etc/os-release
