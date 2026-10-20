@@ -141,7 +141,9 @@ valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$(date -d "$1" +
 valid_password() { [[ "$1" =~ ^[A-Za-z0-9._@%+=,!#^*-]{6,64}$ ]]; }
 valid_url() { [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; }
 valid_hostport() {
-  [[ "$1" =~ ^([0-9.]+):([0-9]+)$ ]] && valid_ipv4 "${BASH_REMATCH[1]}" && valid_port "${BASH_REMATCH[2]}"
+  [[ "$1" =~ ^([0-9.]+):([0-9]+)$ ]] || return 1
+  local h="${BASH_REMATCH[1]}" p="${BASH_REMATCH[2]}"
+  valid_ipv4 "$h" && valid_port "$p"
 }
 valid_domain() {
   [ "${#1}" -le 253 ] && [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]
@@ -714,7 +716,7 @@ guest_setup_files() {
   gwrite etc/hostname 644 <<<"$G_NAME" || return 1
   printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$G_NAME" | gwrite etc/hosts 644
   for t in $S_DNS; do echo "nameserver $t"; done | gwrite etc/resolv.conf 644
-  tr -d '-' </proc/sys/kernel/random/uuid | gwrite etc/machine-id 444
+  printf '%s\n' "$(tr -d -- '-\n' </proc/sys/kernel/random/uuid)" | gwrite etc/machine-id 444
   printf '\n  Welcome to %s (an Eris Box machine).\n  See your limits with: nproc, free -h, df -h /\n\n' "$G_NAME" | gwrite etc/motd 644
   for t in rsa ecdsa ed25519; do
     rm -f "$m/etc/ssh/ssh_host_${t}_key" "$m/etc/ssh/ssh_host_${t}_key.pub"
@@ -992,14 +994,14 @@ table bridge erisbox_br
 delete table bridge erisbox_br
 
 table inet erisbox {
-  chain input {
+  chain guest_input {
     type filter hook input priority -5; policy accept;
     iifname "$br" ct state established,related accept
     iifname "$br" icmp type { echo-request, destination-unreachable, time-exceeded } accept
 $( [ "$S_PROXY_ENABLED" = 1 ] && printf '    iifname "%s" tcp dport { 80, 443 } accept' "$br" )
     iifname "$br" drop
   }
-  chain forward {
+  chain guest_forward {
     type filter hook forward priority -5; policy accept;
     iifname "$br" oifname "$br" ct status dnat accept
     iifname "$br" oifname "$br" drop
@@ -1021,13 +1023,13 @@ ${mkd}  }
 }
 
 table ip erisbox_nat {
-  chain pre {
+  chain nat_pre {
     type nat hook prerouting priority -105; policy accept;
 ${dn}${pt}  }
-  chain out {
+  chain nat_out {
     type nat hook output priority -105; policy accept;
 ${dn}${po}  }
-  chain post {
+  chain nat_post {
     type nat hook postrouting priority 95; policy accept;
 ${sn}    oifname "$br" ip saddr $sub ct status dnat masquerade
     oifname != "$br" ip saddr $sub masquerade
@@ -1035,11 +1037,11 @@ ${sn}    oifname "$br" ip saddr $sub ct status dnat masquerade
 }
 
 table bridge erisbox_br {
-  chain pre {
+  chain br_ingress {
     type filter hook prerouting priority -200; policy accept;
 ${brl}    iifname "ebx*" ether type != { ip, arp } drop
   }
-  chain fwd {
+  chain br_forward {
     type filter hook forward priority -200; policy accept;
     iifname "ebx*" oifname "ebx*" drop
   }
