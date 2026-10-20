@@ -2309,7 +2309,7 @@ HOST_RESERVE=268435456   # RAM kept for the server itself (256M)
 res_compute() {
   local n c
   R_CPUS="$(host_cpus)"; R_MEM="$(host_mem)"; R_SWAP="$(host_swap)"
-  read -r R_DTOT R_DUSED R_DFREE < <(df -B1 --output=size,used,avail "$VAR_DIR" | tail -1)
+  read -r R_DTOT R_DFREE < <(df -B1 --output=size,avail "$VAR_DIR" | tail -1)
   R_CPU_GIVEN=0; R_MEM_GIVEN=0; R_SWAP_GIVEN=0; R_DISK_GIVEN=0; R_COUNT=0
   for n in $(g_names); do
     [ "$n" = "${1:-}" ] && continue
