@@ -125,8 +125,10 @@ check "t1 reaches the internet" retry 30 inside t1 curl -fsS -o /dev/null --max-
 check "apt works inside t1" inside t1 sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null'
 check "SSH banner on $HOSTIP:$SSH1" retry 30 is_ssh banner cli "$HOSTIP" "$SSH1"
 check "SSH password login" eq "$(ip netns exec cli sshpass -p Test-Pass-1234 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP hostname)" t1
-LOGIN="$(ip netns exec cli sshpass -p Test-Pass-1234 ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP exit 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+# an interactive login (sshd shows login messages only without a remote command)
+LOGIN="$( (sleep 4; printf 'exit\n') | ip netns exec cli timeout 30 sshpass -p Test-Pass-1234 ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
 check "a real SSH login shows the colourful banner" grep -q 'T 1' <<<"$LOGIN"
+grep -q 'T 1' <<<"$LOGIN" || echo "$LOGIN" | head -n 20 | sed 's/^/          login: /'
 inside t1 sh -c 'mkdir -p /srv && echo hello-t1 > /srv/index.html'
 guest_service t1 web1 /usr/bin/python3 -m http.server "$P1" --directory /srv
 check "port range forward $HOSTIP:$P1" retry 20 sh -c "[ \"\$(ip netns exec cli curl -fsS --max-time 5 http://$HOSTIP:$P1/)\" = hello-t1 ]"
@@ -147,7 +149,8 @@ echo "  INFO  swap used by t1: $(( $(cgv t1 memory.swap.current) / 1048576 )) MB
 check "RAM stays within 200M" between "$(( $(cgv t1 memory.current) / 1048576 ))" 1 205
 inside t1 systemctl stop memhog >/dev/null 2>&1
 OOM0="$(cgv t1 memory.events | awk '/^oom_kill /{print $2}')"
-check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 timeout 240 systemd-run --wait --quiet -p OOMScoreAdjust=1000 python3 -c "x=bytes(1)*(1400<<20)"
+# random data: newer kernels (7.x) store swapped-out zero pages specially, so zeros would not hit the limit
+check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 timeout 300 systemd-run --wait --quiet -p OOMScoreAdjust=1000 python3 -c "import os; x=os.urandom(1400<<20)"
 sleep 3
 check "the machine survives the OOM kill" running t1
 check "oom_kill counted" sh -c "[ \$(lxc-cgroup -n t1 memory.events | awk '/^oom_kill /{print \$2}') -gt ${OOM0:-0} ]"
