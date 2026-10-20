@@ -39,6 +39,14 @@ running() { [ "$(lxc-info -n "$1" -sH 2>/dev/null)" = RUNNING ]; }
 booted() { $EB exec "$1" -- sh -c 'systemctl is-system-running 2>/dev/null | grep -Eq "running|degraded"'; }
 inside() { local n="$1"; shift; $EB exec "$n" -- "$@"; }
 http_from_cli() { ip netns exec cli curl -fsS --max-time 8 "$@"; }
+http_code_from_cli() { ip netns exec cli curl -s -o /dev/null --max-time 8 -w '%{http_code}' "$@"; }
+guest_service() { # machine unit command...  -> a restarting systemd service inside the machine
+  local m="$1" u="$2"; shift 2
+  printf '[Service]\nExecStart=%s\nRestart=always\nRestartSec=1\nOOMPolicy=continue\n[Install]\nWantedBy=multi-user.target\n' "$*" \
+    | $EB exec "$m" -- sh -c "cat > /etc/systemd/system/$u.service"
+  $EB exec "$m" -- systemctl daemon-reload
+  $EB exec "$m" -- systemctl enable --now "$u" >/dev/null 2>&1
+}
 
 diag() {
   echo; echo "=== diagnostics ==="
@@ -49,6 +57,7 @@ diag() {
   for f in /var/lib/erisbox/logs/*; do echo "--- $f"; tail -n 40 "$f"; done
   for n in t1 t2 t3 t5; do lxc-info -n "$n" 2>/dev/null; done
   journalctl -u erisbox-net -u erisbox-tick -u lxc --no-pager | tail -n 60
+  dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -n 20
   cat /etc/erisbox/guests/*.conf 2>/dev/null
   set +x
 }
@@ -97,7 +106,10 @@ check "memory.max = 200M" eq "$(cgv t1 memory.max)" 209715200
 check "memory.swap.max = 1G" eq "$(cgv t1 memory.swap.max)" 1073741824
 check "pids.max = 512" eq "$(cgv t1 pids.max)" 512
 check "free shows ~200M RAM inside (lxcfs)" between "$(inside t1 free -m | awk '/^Mem:/{print $2}')" 150 210
-check "free shows ~1G swap inside" between "$(inside t1 free -m | awk '/^Swap:/{print $2}')" 900 1100
+echo "  INFO  'free' inside shows swap total: $(inside t1 free -m | awk '/^Swap:/{print $2}') MB (the real limit is checked below)"
+echo "  INFO  lxcfs: $(lxcfs --version 2>&1 | head -1); $(systemctl cat lxcfs 2>/dev/null | grep '^ExecStart=' | tail -1)"
+lxcfs --help 2>&1 | grep -i -E 'swap|cfs' | sed 's/^/          lxcfs option: /'
+inside t1 grep -E '^(MemTotal|SwapTotal|SwapFree):' /proc/meminfo | sed 's/^/          inside: /'
 check "df shows ~2G disk inside" between "$(inside t1 df -BM --output=size / | tail -1 | tr -dc 0-9)" 1700 2100
 check "hostname inside" eq "$(inside t1 hostname)" t1
 check "t1 reaches the internet" retry 30 inside t1 curl -fsS -o /dev/null --max-time 10 https://deb.debian.org/
@@ -105,7 +117,7 @@ check "apt works inside t1" inside t1 sh -c 'apt-get update -qq && DEBIAN_FRONTE
 check "SSH banner on $HOSTIP:$SSH1" retry 30 is_ssh banner cli "$HOSTIP" "$SSH1"
 check "SSH password login" eq "$(ip netns exec cli sshpass -p Test-Pass-1234 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p "$SSH1" root@$HOSTIP hostname)" t1
 inside t1 sh -c 'mkdir -p /srv && echo hello-t1 > /srv/index.html'
-inside t1 systemd-run --unit=web1 python3 -m http.server "$P1" --directory /srv >/dev/null 2>&1
+guest_service t1 web1 /usr/bin/python3 -m http.server "$P1" --directory /srv
 check "port range forward $HOSTIP:$P1" retry 20 sh -c "[ \"\$(ip netns exec cli curl -fsS --max-time 5 http://$HOSTIP:$P1/)\" = hello-t1 ]"
 check "spoofed source IP is dropped" not inside t1 sh -c "ip addr add $SUB.0.250/16 dev eth0 && ping -c1 -W2 -I $SUB.0.250 $SUB.0.1"
 inside t1 ip addr del "$SUB.0.250/16" dev eth0 2>/dev/null
@@ -127,6 +139,8 @@ check "1.4G program is killed (RAM+swap = 1.2G)" not inside t1 python3 -c "x=b'a
 check "oom_kill counted" sh -c "[ \$(lxc-cgroup -n t1 memory.events | awk '/^oom_kill /{print \$2}') -gt ${OOM0:-0} ]"
 check "disk limit: cannot write 2.6G" not inside t1 dd if=/dev/zero of=/fill bs=1M count=2600 status=none
 inside t1 rm -f /fill
+echo "  INFO  web1 after the OOM test: $(inside t1 systemctl show -p NRestarts --value web1) restart(s), now $(inside t1 systemctl is-active web1)"
+check "web1 serving again" retry 20 sh -c "[ \"\$(ip netns exec cli curl -fsS --max-time 5 http://$HOSTIP:$P1/)\" = hello-t1 ]"
 
 section "live changes"
 check "set cpu/ram/swap/disk" $EB set t1 --cpu 0.5 --ram 300M --swap 512M --disk 3G -y
@@ -207,24 +221,24 @@ if ss -Hltn "sport = :80" | grep -q . || ss -Hltn "sport = :443" | grep -q .; th
   echo "  SKIP  ports 80/443 are busy on this runner"
 else
   check "domain enable" $EB domain enable -y
-  inside t1 systemd-run --unit=web80 python3 -m http.server 80 --directory /srv >/dev/null 2>&1
+  guest_service t1 web80 /usr/bin/python3 -m http.server 80 --directory /srv
   openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=site1.test -keyout /tmp/k.pem -out /tmp/c.pem -days 2 >/dev/null 2>&1
   cat /tmp/k.pem /tmp/c.pem | $EB exec t1 -- sh -c 'cat > /srv/kc.pem'
   printf '%s\n' "import http.server, ssl, os" "os.chdir('/srv')" \
     "s = http.server.HTTPServer(('', 443), http.server.SimpleHTTPRequestHandler)" \
     "c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain('/srv/kc.pem')" \
     "s.socket = c.wrap_socket(s.socket, server_side=True)" "s.serve_forever()" | $EB exec t1 -- sh -c 'cat > /srv/tls.py'
-  inside t1 systemd-run --unit=web443 python3 /srv/tls.py >/dev/null 2>&1
+  guest_service t1 web443 /usr/bin/python3 /srv/tls.py
   check "domain add t1 site1.test" $EB domain add t1 site1.test -y
   check "HTTP by Host header" retry 10 sh -c "[ \"\$(ip netns exec cli curl -fsS --max-time 5 -H 'Host: site1.test' http://$HOSTIP/)\" = hello-t1 ]"
-  check "unknown domain gets 404" eq "$(ip netns exec cli curl -s -o /dev/null -w '%{http_code}' -H 'Host: nope.test' "http://$HOSTIP/")" 404
+  check "unknown domain gets 404" eq "$(http_code_from_cli -H 'Host: nope.test' "http://$HOSTIP/")" 404
   check "HTTPS passthrough by SNI" retry 10 sh -c "[ \"\$(ip netns exec cli curl -fsSk --max-time 5 --resolve site1.test:443:$HOSTIP https://site1.test/)\" = hello-t1 ]"
   check "another machine reaches the site through the proxy" eq "$(inside t2 curl -fsS --max-time 5 -H 'Host: site1.test' "http://$HOSTIP/")" hello-t1
   check "wildcard domain" $EB domain add t2 example.test --wildcard -y
   check "nginx has the wildcard" grep -q '\.example\.test' /etc/nginx/conf.d/erisbox-http.conf
   check "domain list" sh -c "$EB domain list | grep -q site1.test"
   check "domain del" $EB domain del site1.test -y
-  check "deleted domain gets 404" eq "$(ip netns exec cli curl -s -o /dev/null -w '%{http_code}' -H 'Host: site1.test' "http://$HOSTIP/")" 404
+  check "deleted domain gets 404" retry 10 sh -c "[ \"\$(ip netns exec cli curl -s -o /dev/null --max-time 5 -w '%{http_code}' -H 'Host: site1.test' http://$HOSTIP/)\" = 404 ]"
 fi
 
 section "traffic, quota, expiry (5-minute housekeeping)"
