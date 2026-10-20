@@ -969,8 +969,14 @@ guest_start() {
   # mount the disk here: LXC hooks run under lxc-start's AppArmor profile, which forbids loop mounts
   guest_mount || return 1
   ip link del "$(g_veth)" >/dev/null 2>&1
-  # the LXC monitor lives as long as the machine: never let it inherit our lock or output pipes
-  if ! lxc-start -n "$n" -l WARN -o "$LOG_DIR/$n.log" </dev/null >/dev/null 2>&1 8>&- 9>&-; then
+  # The LXC monitor lives as long as the machine. Start it in its own systemd scope so it never
+  # belongs to whoever started it (the API service, the 5-minute timer, an SSH session) and
+  # never inherits our lock or output pipes.
+  local scope=()
+  if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    scope=(systemd-run --scope --quiet --collect --unit "erisbox-$n-$(date +%s%N | cut -c1-13)")
+  fi
+  if ! "${scope[@]}" lxc-start -n "$n" -l WARN -o "$LOG_DIR/$n.log" </dev/null >/dev/null 2>&1 8>&- 9>&-; then
     err "could not start $n - log: $LOG_DIR/$n.log"
     tail -n 15 "$LOG_DIR/$n.log" >&2 2>/dev/null
     return 1
@@ -2583,7 +2589,6 @@ ExecStart=/usr/bin/python3 $API_PY
 Restart=on-failure
 RestartSec=3
 Environment=NO_COLOR=1
-MemoryMax=80M
 
 [Install]
 WantedBy=multi-user.target

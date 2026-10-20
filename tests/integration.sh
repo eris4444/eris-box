@@ -307,6 +307,12 @@ api_check "stop" 200 '.machine.state == "STOPPED"' POST /machines/apibox/stop
 api_check "start" 200 '.machine.state == "RUNNING"' POST /machines/apibox/start
 api_check "change RAM" 200 '.machine.ram == "300M"' PATCH /machines/apibox '{"ram":"300M"}'
 check "RAM changed live" eq "$(cgv apibox memory.max)" 314572800
+check "machine is not inside the API service's cgroup" not sh -c "systemd-cgls -u erisbox-api.service 2>/dev/null | grep -q 'lxc-start\|\[lxc monitor\]'"
+systemctl restart erisbox-api
+sleep 2
+check "restarting the API keeps the machine running" running apibox
+check "and it can still be managed" sh -c "$EB stop apibox && $EB start apibox"
+retry 10 sh -c "ip netns exec cli curl -sk --pinnedpubkey '$PIN' '$API/ping' | grep -q true"
 api_check "list" 200 '[.machines[].name] | index("apibox") != null' GET /machines
 api_check "unknown machine" 404 '.code == "not_found"' GET /machines/nope
 api_check "unknown plan" 404 '.code == "not_found"' POST /machines '{"plan":"nope"}'
