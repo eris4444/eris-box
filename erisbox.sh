@@ -2553,6 +2553,7 @@ API_TOKENS=$ETC_DIR/api-tokens
 API_DIR=$ETC_DIR/api
 API_PY=$LIB_DIR/api.py
 A_KEYS="PORT TLS CERT KEY ALLOW"
+# shellcheck disable=SC2034  # A_KEY is written by a_save (indirectly) and read by api.py
 a_load() { A_PORT=9443; A_TLS=1; A_CERT="$API_DIR/cert.pem"; A_KEY="$API_DIR/key.pem"; A_ALLOW=""; kv_load "$API_CONF" A_; }
 # shellcheck disable=SC2086
 a_save() { kv_save "$API_CONF" A_ $A_KEYS; }
@@ -2689,7 +2690,7 @@ api_token() {
     add|new|create)
       valid_name "$name" || die "usage: erisbox api token add NAME [--read-only]   (name: a-z, 0-9, -)"
       grep -q "^$name:" "$API_TOKENS" && die "a token called $name already exists (delete it first)"
-      has_flag read-only && perm=read
+      has_flag read-only && perm="read"
       tok="eb_$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)"
       hash="$(printf '%s' "$tok" | sha256sum | cut -d' ' -f1)"
       echo "$name:$hash:$perm:$(date +%F)" >> "$API_TOKENS"
