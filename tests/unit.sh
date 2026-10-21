@@ -186,6 +186,29 @@ yes size_ok 200M 64M
 no size_ok 10M 64M
 no size_ok lots 64M
 
+# usage statistics from samples: CPU counter reset on restart, stopped sample, sampling gap, 1h / 24h / 7d windows
+STAT_DIR="$TMPD/stats"; mkdir -p "$STAT_DIR"; NOW=$(date +%s)
+{
+  echo "$((NOW - 172800)) 1 0 0 0 0"
+  echo "$((NOW - 172500)) 1 270000000 0 0 0"
+  echo "$((NOW - 1800)) 1 1000000000 104857600 500 1000"
+  echo "$((NOW - 1500)) 1 1030000000 104857600 500 1000"
+  echo "$((NOW - 1200)) 1 1060000000 104857600 550 1000"
+  echo "$((NOW - 900)) 1 5000000 209715200 550 1000"
+  echo "$((NOW - 600)) 1 65000000 209715200 600 1000"
+  echo "$((NOW - 300)) 0 0 0 0 0"
+} > "$STAT_DIR/alpha.log"
+eq "stats_calc" "$(stats_calc alpha)" "0.0000 0.1333 0.1333 0.3250 0.2000 0 146800640 146800640 104857600 209715200 600 1000 8 $((NOW - 172800))"
+eq "stats_calc without samples" "$(stats_calc beta)" "-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 0 0"
+eq "pct_of" "$(pct_of 0.05 0.2) $(pct_of -1.0000 0.2) $(pct_of 150 200)" "25% - 75%"
+if command -v python3 >/dev/null 2>&1; then
+  g_load alpha
+  eq "usage_json" "$(usage_json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cpu"]["avg_1h"], d["cpu"]["now"], d["ram"]["max_24h"], d["disk_used_bytes"], d["ram_limit_bytes"], d["samples"])')" \
+    "0.1333 0.0 209715200 600 209715200 8"
+  g_load beta
+  eq "usage_json without samples" "$(usage_json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cpu"]["avg_24h"], d["disk_used_bytes"], d["since"])')" "None None None"
+fi
+
 # API server against a fake erisbox: auth, read-only tokens, routing, errors, lockout
 if command -v python3 >/dev/null 2>&1; then
   api_py > "$TMPD/api.py"
@@ -201,6 +224,9 @@ case "$1" in
   create) printf '%s\n' "$@" > "$(dirname "$0")/create-args"   # (the API passes a clean environment)
           [ "$2" = full ] && { echo "[x] server is full: RAM sale limit reached" >&2; exit 1; }
           exit 0 ;;
+  usage) if [ "${2:-}" = --json ]; then echo '[{"name":"alpha","cpu":{"avg_24h":0.1}}]'
+         elif [ "$2" = nope ]; then echo "[x] machine 'nope' not found (see: erisbox list)" >&2; exit 1
+         else printf '{"name":"%s","cpu":{"avg_24h":0.1}}\n' "$2"; fi ;;
   port) printf '%s\n' "$@" > "$(dirname "$0")/port-args"
         [ "$2" = ssh ] && [ "$4" = 22 ] && { echo "[x] already used by this server (tcp 22)" >&2; exit 1; }
         exit 0 ;;
@@ -263,6 +289,10 @@ if open(portargs).read().split("\n")[:4] != ["port", "ssh", "alpha", "auto"]:
     print("FAIL: api ssh-port auto args: %r" % open(portargs).read())
 check("ssh port taken", req("POST", "/machines/alpha/ssh-port", {"port": 22}), 409, lambda d: d["code"] == "conflict")
 check("ssh port read-only", req("POST", "/machines/alpha/ssh-port", {"port": 2298}, token="eb_read"), 403, lambda d: d["code"] == "read_only")
+check("usage of all machines", req("GET", "/usage"), 200, lambda d: d["machines"][0]["name"] == "alpha")
+check("usage of one machine", req("GET", "/machines/alpha/usage"), 200, lambda d: d["usage"]["name"] == "alpha" and d["usage"]["cpu"]["avg_24h"] == 0.1)
+check("usage with a read-only token", req("GET", "/usage", token="eb_read"), 200)
+check("usage of an unknown machine", req("GET", "/machines/nope/usage"), 404, lambda d: d["code"] == "not_found")
 check("bad value", req("POST", "/machines", {"cpu": {"x": 1}}), 400, lambda d: d["code"] == "bad_value")
 check("newline value", req("POST", "/machines", {"password": "a\nb"}), 400, lambda d: d["code"] == "bad_value")
 check("bad json", req("POST", "/machines", raw=b"{nope"), 400, lambda d: d["code"] == "bad_json")

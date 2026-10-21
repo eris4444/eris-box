@@ -67,6 +67,8 @@ past the real free disk. When a plan does not fit any more, `GET /plans` shows
 | GET | `/resources` | | server cores / RAM / swap / disk: total, given, free |
 | GET | `/os` | | operating systems and whether their image is ready |
 | GET | `/machines` | | `machines`: list of machine objects |
+| GET | `/usage` | | `machines`: usage of every machine (see below, since 1.4.0) |
+| GET | `/machines/NAME/usage` | | `usage`: one machine (since 1.4.0) |
 | POST | `/machines` | `{"plan":"small"}` (+ optional fields below) | **201** `machine` |
 | GET | `/machines/NAME` | | `machine` |
 | PATCH | `/machines/NAME` | `{"ram":"512M","cpu":0.5,"disk":"4G","speed":20,"traffic":200,"expire":"2027-01-31"}` | `machine` |
@@ -118,6 +120,23 @@ in advance). If your bot can't wait that long, send `"async": true`. You get
 `note` is `""`, `"expired"` or `"overquota"`. Expired or over-quota machines are stopped
 automatically. `renew` (or `traffic/reset`) brings them back. `text` and `text_fa` hold the
 connection details only (no RAM / CPU / disk), ready to send to the customer.
+
+### The usage object (`/usage`, since 1.4.0)
+
+```json
+{
+  "name": "u7k2m9xq", "state": "RUNNING", "cpu_limit": 0.2, "ram_limit_bytes": 209715200,
+  "disk_size_bytes": 2040373248, "disk_used_bytes": 431001600,
+  "cpu": {"now": 0.012, "avg_1h": 0.03, "avg_24h": 0.021, "avg_7d": 0.018, "max_24h": 0.19},
+  "ram": {"now": 52428800, "avg_1h": 50331648, "avg_24h": 48234496, "avg_7d": 47185920, "max_24h": 104857600},
+  "samples": 288, "since": "2026-10-20 09:05"
+}
+```
+
+CPU is in cores (0.03 of a 0.2 limit = 15%), RAM in bytes (page cache not counted). Eris Box takes a
+sample of every machine every 5 minutes and keeps 7 days; values are `null` until there is data
+(CPU needs two samples). Stopped time is left out of the averages. `erisbox usage [NAME]` shows the
+same on the server, `erisbox usage --sample` takes a sample now.
 
 ## 4. Examples
 

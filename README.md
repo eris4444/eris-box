@@ -178,6 +178,7 @@ erisbox reinstall alice --os debian-12
 erisbox stop|start|restart alice
 erisbox delete alice
 erisbox status                    # server usage and what was given out
+erisbox usage [alice]             # average CPU / RAM (1h, 24h, 7d) and disk fill of each machine
 erisbox update                    # latest version from GitHub
 erisbox help
 ```
@@ -238,6 +239,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/eris4444/eris-box/main/insta
 - **منابع سرور:** `erisbox resources` نشان می‌دهد سرور چند هسته، چقدر رم و دیسک دارد، چقدرش را
   به ماشین‌ها داده‌ای و چقدر آزاد مانده. در ساخت ماشین هم کنار هر سؤال مقدار آزاد را می‌بینی.
 - **پیام ورود ماشین:** فقط اسم ماشین و سیستم‌عاملش، رنگی. رم و CPU و دیسک را نشان نمی‌دهد.
+- **مصرف ماشین‌ها:** `erisbox usage` میانگین مصرف CPU و رم هر ماشین (۱ ساعت، ۲۴ ساعت، ۷ روز) و
+  پر بودن دیسکش را نشان می‌دهد (هر ۵ دقیقه یک نمونه، ۷ روز نگه داشته می‌شود؛ در API: `GET /usage`).
 - **IP اختصاصی:** اول IP را از شرکت سرورت بخر و به همین سرور وصل کن، بعد:
   `erisbox ip add ali 5.6.7.8` (حداکثر ۲ IP برای هر ماشین؛ همه‌ی پورت‌ها مال همان ماشین می‌شود)
 - **پورت روی IP خود سرور:** هر ماشین یک پورت SSH و یک بازه پورت می‌گیرد. پورت بیشتر:

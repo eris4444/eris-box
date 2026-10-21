@@ -316,6 +316,16 @@ check "SSH login on the new port" retry 30 sh -c "[ \"\$(ip netns exec cli sshpa
 check "the old SSH port is closed" not sh -c "ip netns exec cli sshpass -p '$APW2' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p $APORT_SSH root@$HOSTIP true"
 api_check "port the server itself uses (the API) -> conflict" 409 '.code == "conflict"' POST /machines/apibox/ssh-port '{"port":9443}'
 api_check "SSH port auto" 200 '.machine.ssh_port > 0 and .machine.ssh_port != 2298' POST /machines/apibox/ssh-port '{}'
+# usage statistics: two samples around 8 seconds of busy CPU inside apibox (its plan allows 0.2 cores)
+check "usage sample 1" $EB usage --sample
+$EB exec apibox -- sh -c 'timeout 8 sh -c "while :; do :; done"' >/dev/null 2>&1 &
+sleep 9
+check "usage sample 2" $EB usage --sample
+check "usage: apibox used CPU, RAM and disk" sh -c "$EB usage apibox --json | jq -e '.cpu.avg_1h > 0.05 and .cpu.avg_1h <= 0.3 and .ram.now > 0 and .disk_used_bytes > 0 and .disk_size_bytes > 0 and .samples >= 2'"
+check "usage table lists apibox" sh -c "$EB usage | grep -q apibox"
+check "usage detail of apibox" sh -c "$EB usage apibox | grep -q 'avg 24h'"
+api_check "usage of every machine (API)" 200 '[.machines[].name] | index("apibox") != null' GET /usage
+api_check "usage of one machine (API)" 200 '.usage.name == "apibox" and .usage.cpu.avg_1h > 0.05 and .usage.ram_limit_bytes > 0' GET /machines/apibox/usage
 check "machine is not inside the API service's cgroup" not sh -c "systemd-cgls -u erisbox-api.service 2>/dev/null | grep -q 'lxc-start\|\[lxc monitor\]'"
 systemctl restart erisbox-api
 sleep 2
@@ -338,6 +348,7 @@ JOBNAME="$(jq -r .machine.name <<<"$AB")"
 api_check "delete the async machine" 200 ".deleted == \"$JOBNAME\"" DELETE "/machines/$JOBNAME"
 api_check "delete apibox" 200 '.deleted == "apibox"' DELETE /machines/apibox
 api_check "apibox is gone" 404 '.code == "not_found"' GET /machines/apibox
+check "its usage samples are gone too" not test -e /var/lib/erisbox/stats/apibox.log
 check "allow only another IP" $EB api allow 192.0.2.99 -y
 sleep 2
 check "other IPs get 403" retry 10 sh -c "ip netns exec cli curl -sk --pinnedpubkey '$PIN' -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer $TOKEN' '$API/plans' | grep -q 403"

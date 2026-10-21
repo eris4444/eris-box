@@ -11,7 +11,7 @@
 #
 #  Run "erisbox" for the menu or "erisbox help" for the command line.
 
-SCRIPT_VER="1.3.0"
+SCRIPT_VER="1.4.0"
 REPO="eris4444/eris-box"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
@@ -29,6 +29,7 @@ DISK_DIR=$VAR_DIR/disks
 MNT_DIR=$VAR_DIR/mnt
 CACHE_DIR=$VAR_DIR/cache
 TRAFFIC_DIR=$VAR_DIR/traffic
+STAT_DIR=$VAR_DIR/stats      # usage samples, one line per machine every 5 minutes (7 days kept)
 BACKUP_DIR=$VAR_DIR/backups
 LOG_DIR=$VAR_DIR/logs
 LIB_DIR=/usr/local/lib/erisbox
@@ -2391,7 +2392,7 @@ cmd_delete() {
   guest_umount
   rm -f "$(g_img)"; rmdir "$(g_mnt)" 2>/dev/null
   if [ -f "$LXC_DIR/$name/config" ] && grep -q "^$LXC_MARK" "$LXC_DIR/$name/config"; then rm -rf "${LXC_DIR:?}/$name"; fi
-  rm -f "$TRAFFIC_DIR/$name" "$TRAFFIC_DIR/$name.lock" "$LOG_DIR/$name.log" "$VAR_DIR/banner/$name"
+  rm -f "$TRAFFIC_DIR/$name" "$TRAFFIC_DIR/$name.lock" "$LOG_DIR/$name.log" "$VAR_DIR/banner/$name" "$STAT_DIR/$name.log"
   if [ -s "$DOMAIN_FILE" ] && awk -v n="$name" '$2==n {f=1} END{exit !f}' "$DOMAIN_FILE"; then
     tmp="$(mktemp)"; awk -v n="$name" '$2!=n' "$DOMAIN_FILE" > "$tmp" && cat "$tmp" > "$DOMAIN_FILE"; rm -f "$tmp"
     proxy_render
@@ -3071,6 +3072,14 @@ def h_port_del(body, m):
     return 200, {"ok": True, "machine": machine(m["name"])}
 
 
+def h_usage(body, m):
+    return 200, {"ok": True, "machines": call_json(["usage", "--json"])}
+
+
+def h_machine_usage(body, m):
+    return 200, {"ok": True, "usage": call_json(["usage", m["name"], "--json"])}
+
+
 def h_ssh_port(body, m):
     port = body.get("port")
     call(["port", "ssh", m["name"], val("auto" if port is None else port, "port"), "-y"])
@@ -3093,6 +3102,7 @@ ROUTES = [
     ("GET", "/api/v1/os", h_os, "read"),
     ("GET", "/api/v1/plans", h_plans, "read"),
     ("GET", "/api/v1/machines", h_list, "read"),
+    ("GET", "/api/v1/usage", h_usage, "read"),
     ("POST", "/api/v1/machines", h_create, "full"),
     ("GET", M, h_info, "read"),
     ("PATCH", M, h_change, "full"),
@@ -3107,6 +3117,7 @@ ROUTES = [
     ("POST", M + "/ports", h_port_add, "full"),
     ("DELETE", M + "/ports/(?P<port>[0-9]{1,5})", h_port_del, "full"),
     ("POST", M + "/ssh-port", h_ssh_port, "full"),
+    ("GET", M + "/usage", h_machine_usage, "read"),
     ("GET", "/api/v1/jobs/(?P<job>[0-9a-f]{16})", h_job, "read"),
 ]
 ROUTES = [(meth, re.compile("^" + pat + "/?$"), fn, need) for meth, pat, fn, need in ROUTES]
@@ -3252,6 +3263,114 @@ oversell_warn() { # cpu ram swap
 }
 size_ok() { local b m; b="$(to_bytes "$1")" && m="$(to_bytes "$2")" && [ "$b" -ge "$m" ]; }
 cpu_ok() { valid_num "$1" && [ "$(cpu_quota "$1")" -ge 1000 ] && [ "$(cpu_quota "$1")" -le $(( $(host_cpus) * 100000 )) ]; }
+
+# ================================================================= USAGE ===
+# Every tick (5 min) appends one line per machine to $STAT_DIR/NAME.log:
+#   EPOCH RUNNING CPU_USAGE_USEC RAM_BYTES DISK_USED DISK_SIZE
+# RAM = memory.current minus inactive page cache (what the programs really hold).
+# Averages: CPU from the cpu.stat counter between consecutive running samples (a restart resets the
+# counter - that interval is skipped), RAM as the mean of running samples; disk = latest sample.
+STAT_KEEP=2016   # 7 days of 5-minute samples
+stats_sample() {
+  local n f now run cpu mem inact du ds
+  mkdir -p "$STAT_DIR"; chmod 700 "$STAT_DIR"
+  now="$(date +%s)"
+  for n in $(g_names); do
+    f="$STAT_DIR/$n.log"; run=0; cpu=0; mem=0; du=0; ds=0
+    if g_running "$n"; then
+      run=1
+      cpu="$(cg_read "$n" cpu.stat | awk '/^usage_usec /{v = $2} END {print v}')"
+      mem="$(cg_read "$n" memory.current)"
+      inact="$(cg_read "$n" memory.stat | awk '/^inactive_file /{v = $2} END {print v}')"
+      [[ "${cpu:-x}" =~ ^[0-9]+$ ]] || cpu=0      # (big counters: valid_int stops at 9 digits)
+      [[ "${mem:-x}" =~ ^[0-9]+$ ]] || mem=0
+      [[ "${inact:-x}" =~ ^[0-9]+$ ]] || inact=0
+      mem=$((mem - inact)); [ "$mem" -lt 0 ] && mem=0
+    fi
+    if mountpoint -q "$MNT_DIR/$n"; then read -r du ds < <(df -B1 --output=used,size "$MNT_DIR/$n" | tail -1); fi
+    printf '%s %s %s %s %s %s\n' "$now" "$run" "$cpu" "$mem" "${du:-0}" "${ds:-0}" >> "$f"
+    if [ "$(wc -l < "$f")" -gt $((STAT_KEEP + 100)) ]; then tail -n "$STAT_KEEP" "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"; fi
+  done
+}
+# NAME -> "CPU_NOW CPU_1H CPU_24H CPU_7D CPU_MAX24 RAM_NOW RAM_1H RAM_24H RAM_7D RAM_MAX24 DISK_USED DISK_SIZE SAMPLES FIRST_EPOCH"
+# CPU in cores, RAM/disk in bytes; -1 = no data yet
+stats_calc() {
+  local f="$STAT_DIR/$1.log"
+  [ -s "$f" ] || { echo "-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 0 0"; return 0; }
+  awk -v now="$(date +%s)" '
+    BEGIN { W[1] = 3600; W[2] = 86400; W[3] = 604800; cn = -1; mn = -1; cx = -1; mx = -1; du = -1; ds = -1 }
+    NF >= 6 {
+      t = $1; r = $2; c = $3; m = $4; n++; if (n == 1) first = t
+      if ($6 > 0) { du = $5; ds = $6 }
+      if (r == 1) {
+        for (w = 1; w <= 3; w++) if (t >= now - W[w]) { ms[w] += m; mc[w]++ }
+        if (t >= now - 86400 && m > mx) mx = m
+        mn = m
+        if (pr == 1 && c >= pc && t > pt && t - pt <= 3600) {   # (longer = sampling gap: skipped)
+          d = (c - pc) / ((t - pt) * 1000000)
+          for (w = 1; w <= 3; w++) if (pt >= now - W[w]) { cs[w] += c - pc; ct[w] += t - pt }
+          if (t >= now - 86400 && d > cx) cx = d
+          cn = d
+        }
+      } else { cn = 0; mn = 0 }
+      pt = t; pc = c; pr = r
+    }
+    END {
+      printf "%.4f", cn
+      for (w = 1; w <= 3; w++) printf " %.4f", (ct[w] > 0 ? cs[w] / (ct[w] * 1000000) : -1)
+      printf " %.4f %.0f", cx, mn
+      for (w = 1; w <= 3; w++) printf " %.0f", (mc[w] > 0 ? ms[w] / mc[w] : -1)
+      printf " %.0f %.0f %.0f %d %d\n", mx, du, ds, n, first
+    }' "$f"
+}
+j_num() { if [ "${1:-}" = -1 ] || [ "${1:-}" = -1.0000 ]; then printf 'null'; else json_num "$1"; fi; }
+usage_json() { # the loaded machine as JSON
+  local a
+  read -r -a a < <(stats_calc "$G_NAME")
+  g_usage
+  if [ "$U_DUSED" -gt 0 ] 2>/dev/null; then a[10]="$U_DUSED"; a[11]="$U_DSIZE"; fi   # mounted now: live disk numbers
+  printf '{"name":%s,"state":%s,"cpu_limit":%s,"ram_limit_bytes":%s,"disk_size_bytes":%s,"disk_used_bytes":%s,' \
+    "$(json_str "$G_NAME")" "$(json_str "$(g_state "$G_NAME")")" "$(json_num "$G_CPU")" "$(json_num "$(to_bytes "$G_RAM")")" \
+    "$(j_num "${a[11]}")" "$(j_num "${a[10]}")"
+  printf '"cpu":{"now":%s,"avg_1h":%s,"avg_24h":%s,"avg_7d":%s,"max_24h":%s},' "$(j_num "${a[0]}")" "$(j_num "${a[1]}")" "$(j_num "${a[2]}")" "$(j_num "${a[3]}")" "$(j_num "${a[4]}")"
+  printf '"ram":{"now":%s,"avg_1h":%s,"avg_24h":%s,"avg_7d":%s,"max_24h":%s},' "$(j_num "${a[5]}")" "$(j_num "${a[6]}")" "$(j_num "${a[7]}")" "$(j_num "${a[8]}")" "$(j_num "${a[9]}")"
+  printf '"samples":%s,"since":%s}' "${a[12]}" "$( [ "${a[13]}" -gt 0 ] && json_str "$(date -d "@${a[13]}" '+%F %H:%M')" || printf 'null')"
+}
+pct_of() { awk -v v="$1" -v l="$2" 'BEGIN{ if (v < 0 || l <= 0) print "-"; else printf "%d%%", v * 100 / l + 0.5 }'; }
+cmd_usage() {
+  parse_flags "$@"; need_root; need_installed; s_load
+  local name="${POS[0]:-}" n first=1 a lim
+  if has_flag sample; then stats_sample; ok "usage sample taken"; return 0; fi
+  if [ -n "$name" ]; then g_load "$name"; fi
+  if has_flag json; then
+    if [ -n "$name" ]; then usage_json; echo; return 0; fi
+    printf '['
+    for n in $(g_names); do [ "$first" = 1 ] || printf ','; first=0; g_load "$n"; usage_json; done
+    printf ']\n'
+    return 0
+  fi
+  if [ -n "$name" ]; then
+    read -r -a a < <(stats_calc "$name"); g_usage; lim="$(to_bytes "$G_RAM")"
+    [ "$U_DUSED" -gt 0 ] 2>/dev/null && { a[10]="$U_DUSED"; a[11]="$U_DSIZE"; }
+    printf '%s%s%s  (%s, %s samples%s)\n' "$C_BD" "$name" "$C_0" "$(g_state "$name")" "${a[12]}" "$( [ "${a[13]}" -gt 0 ] && printf ' since %s' "$(date -d "@${a[13]}" '+%F %H:%M')")"
+    printf '  %-6s %-10s %-10s %-10s %-10s %-10s %s\n' "" now "avg 1h" "avg 24h" "avg 7d" "peak 24h" "limit"
+    printf '  %-6s %-10s %-10s %-10s %-10s %-10s %s cores\n' CPU "$(pct_of "${a[0]}" "$G_CPU")" "$(pct_of "${a[1]}" "$G_CPU")" "$(pct_of "${a[2]}" "$G_CPU")" "$(pct_of "${a[3]}" "$G_CPU")" "$(pct_of "${a[4]}" "$G_CPU")" "$G_CPU"
+    printf '  %-6s %-10s %-10s %-10s %-10s %-10s %s\n' RAM "$(pct_of "${a[5]}" "$lim")" "$(pct_of "${a[6]}" "$lim")" "$(pct_of "${a[7]}" "$lim")" "$(pct_of "${a[8]}" "$lim")" "$(pct_of "${a[9]}" "$lim")" "$G_RAM"
+    if [ "${a[11]}" -gt 0 ] 2>/dev/null; then printf '  %-6s %s of %s (%s full)\n' DISK "$(human "${a[10]}")" "$(human "${a[11]}")" "$(pct_of "${a[10]}" "${a[11]}")"; fi
+    [ "${a[12]}" -ge 2 ] || printf '  %s(averages appear after two samples - one every 5 minutes)%s\n' "$C_D" "$C_0"
+    return 0
+  fi
+  printf '%s%-14s %-8s %-22s %-22s %s%s\n' "$C_BD" NAME STATE "CPU avg 1h/24h/7d" "RAM avg 24h / peak" "DISK used" "$C_0"
+  for n in $(g_names); do
+    g_load "$n"; read -r -a a < <(stats_calc "$n"); g_usage; lim="$(to_bytes "$G_RAM")"
+    [ "$U_DUSED" -gt 0 ] 2>/dev/null && { a[10]="$U_DUSED"; a[11]="$U_DSIZE"; }
+    printf '%-14s %-8s %-22s %-22s %s\n' "$n" "$(g_state "$n")" \
+      "$(pct_of "${a[1]}" "$G_CPU") $(pct_of "${a[2]}" "$G_CPU") $(pct_of "${a[3]}" "$G_CPU") of $G_CPU" \
+      "$(pct_of "${a[7]}" "$lim") / $(pct_of "${a[9]}" "$lim") of $G_RAM" \
+      "$( [ "${a[11]}" -gt 0 ] 2>/dev/null && printf '%s/%s (%s)' "$(human "${a[10]}")" "$(human "${a[11]}")" "$(pct_of "${a[10]}" "${a[11]}")" || printf -- '-')"
+  done
+  printf '%s(percent of each machine'"'"'s own limit; a sample is taken every 5 minutes, 7 days are kept)%s\n' "$C_D" "$C_0"
+}
 
 # ================================================================ STATUS ===
 cmd_status() {
@@ -3489,6 +3608,8 @@ cmd_tick() {
       fi
     fi
   done
+  G_NAME=""
+  stats_sample
 }
 
 # ================================================================== MENU ===
@@ -3554,6 +3675,7 @@ menu_main() {
     13) API for selling bots
    ${C_BD}Server${C_0}
      6) Server resources and usage (cores, RAM, disk: total / given / free)
+    14) Machine usage (average CPU and RAM, how full each disk is)
      7) Backups
      8) Settings
      9) Install / repair
@@ -3577,6 +3699,7 @@ EOF
       11) run_action cmd_uninstall; [ -x "$BIN_PATH" ] || exit 0 ;;
       12) menu_plans ;;
       13) menu_api ;;
+      14) run_action cmd_usage ;;
       0|q|exit) exit 0 ;;
     esac
   done
@@ -3660,6 +3783,7 @@ menu_machine() {
     10) Reinstall the OS (erases its files)
     11) Backup now
     12) Delete this machine
+    13) Usage (average CPU / RAM, disk fill)
      0) Back
 
 EOF
@@ -3677,6 +3801,7 @@ EOF
       10) run_action cmd_reinstall "$n" ;;
       11) run_action cmd_backup "$n" ;;
       12) run_action cmd_delete "$n" ;;
+      13) run_action cmd_usage "$n" ;;
       0|b|q|"") return 0 ;;
     esac
   done
@@ -3930,6 +4055,8 @@ Selling
 Server
   install [--swap SIZE | --no-swap] [--prebuild]
   resources                           server cores / RAM / swap / disk: total, given, free
+  usage [NAME] [--json]               average CPU / RAM (1h, 24h, 7d) and disk fill of the machines
+                                      (sampled every 5 minutes; --sample takes one now)
   status                              image list | build OS | delete OS
   settings [show | set KEY VALUE]     update | uninstall [--purge]
 
@@ -3966,6 +4093,7 @@ main() {
     delete|remove|rm|destroy) cmd_delete "$@" ;;
     status|host|stats) cmd_status "$@" ;;
     resources|res|free) cmd_resources "$@" ;;
+    usage|top) cmd_usage "$@" ;;
     plan|plans) cmd_plan "$@" ;;
     api) cmd_api "$@" ;;
     image|images) cmd_image "$@" ;;
