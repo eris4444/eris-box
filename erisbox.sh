@@ -103,7 +103,7 @@ pause() {
 # ----------------------------------------------------------------- flags ---
 declare -A F=()
 POS=()
-BOOL_FLAGS=" all boot force json no-start no-swap no-tls prebuild purge read-only reset reset-traffic strict wildcard "
+BOOL_FLAGS=" all boot force json no-start no-swap no-tls prebuild purge read-only reset reset-traffic sample strict wildcard "
 parse_flags() {
   F=(); POS=()
   local k

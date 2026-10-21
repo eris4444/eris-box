@@ -201,6 +201,8 @@ STAT_DIR="$TMPD/stats"; mkdir -p "$STAT_DIR"; NOW=$(date +%s)
 eq "stats_calc" "$(stats_calc alpha)" "0.0000 0.1333 0.1333 0.3250 0.2000 0 146800640 146800640 104857600 209715200 600 1000 8 $((NOW - 172800))"
 eq "stats_calc without samples" "$(stats_calc beta)" "-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 0 0"
 eq "pct_of" "$(pct_of 0.05 0.2) $(pct_of -1.0000 0.2) $(pct_of 150 200)" "25% - 75%"
+parse_flags apibox --sample --json
+eq "usage flags take no value" "$(has_flag sample && has_flag json && echo yes) ${POS[*]}" "yes apibox"
 if command -v python3 >/dev/null 2>&1; then
   g_load alpha
   eq "usage_json" "$(usage_json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cpu"]["avg_1h"], d["cpu"]["now"], d["ram"]["max_24h"], d["disk_used_bytes"], d["ram_limit_bytes"], d["samples"])')" \
