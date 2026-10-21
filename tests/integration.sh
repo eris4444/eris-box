@@ -307,6 +307,15 @@ api_check "stop" 200 '.machine.state == "STOPPED"' POST /machines/apibox/stop
 api_check "start" 200 '.machine.state == "RUNNING"' POST /machines/apibox/start
 api_check "change RAM" 200 '.machine.ram == "300M"' PATCH /machines/apibox '{"ram":"300M"}'
 check "RAM changed live" eq "$(cgv apibox memory.max)" 314572800
+api_check "add a port" 200 '[.machine.ports[].from] | index(34567) != null' POST /machines/apibox/ports '{"port":"34567"}'
+api_check "same port again -> conflict" 409 '.code == "conflict"' POST /machines/apibox/ports '{"port":"34567"}'
+api_check "remove the port" 200 '[.machine.ports[].from] | index(34567) == null' DELETE /machines/apibox/ports/34567
+api_check "change SSH port" 200 '.machine.ssh_port == 2298 and (.machine.ssh | endswith("-p 2298"))' POST /machines/apibox/ssh-port '{"port":2298}'
+APW2="$(jq -r .machine.password <<<"$AB")"   # (the random password set above: letters and digits only)
+check "SSH login on the new port" retry 30 sh -c "[ \"\$(ip netns exec cli sshpass -p '$APW2' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p 2298 root@$HOSTIP hostname)\" = apibox ]"
+check "the old SSH port is closed" not sh -c "ip netns exec cli sshpass -p '$APW2' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p $APORT_SSH root@$HOSTIP true"
+api_check "port the server itself uses (the API) -> conflict" 409 '.code == "conflict"' POST /machines/apibox/ssh-port '{"port":9443}'
+api_check "SSH port auto" 200 '.machine.ssh_port > 0 and .machine.ssh_port != 2298' POST /machines/apibox/ssh-port '{}'
 check "machine is not inside the API service's cgroup" not sh -c "systemd-cgls -u erisbox-api.service 2>/dev/null | grep -q 'lxc-start\|\[lxc monitor\]'"
 systemctl restart erisbox-api
 sleep 2

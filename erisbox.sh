@@ -11,7 +11,7 @@
 #
 #  Run "erisbox" for the menu or "erisbox help" for the command line.
 
-SCRIPT_VER="1.2.0"
+SCRIPT_VER="1.3.0"
 REPO="eris4444/eris-box"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 
@@ -3071,6 +3071,12 @@ def h_port_del(body, m):
     return 200, {"ok": True, "machine": machine(m["name"])}
 
 
+def h_ssh_port(body, m):
+    port = body.get("port")
+    call(["port", "ssh", m["name"], val("auto" if port is None else port, "port"), "-y"])
+    return 200, {"ok": True, "machine": machine(m["name"])}
+
+
 def h_job(body, m):
     with _jobs_lock:
         job = dict(JOBS.get(m["job"], {}))
@@ -3100,6 +3106,7 @@ ROUTES = [
     ("DELETE", M + r"/ips/(?P<ip>[0-9]{1,3}(\.[0-9]{1,3}){3})", h_ip_del, "full"),
     ("POST", M + "/ports", h_port_add, "full"),
     ("DELETE", M + "/ports/(?P<port>[0-9]{1,5})", h_port_del, "full"),
+    ("POST", M + "/ssh-port", h_ssh_port, "full"),
     ("GET", "/api/v1/jobs/(?P<job>[0-9a-f]{16})", h_job, "read"),
 ]
 ROUTES = [(meth, re.compile("^" + pat + "/?$"), fn, need) for meth, pat, fn, need in ROUTES]

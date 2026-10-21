@@ -151,8 +151,8 @@ curl -sk --pinnedpubkey "$(erisbox api pin)" -H "Authorization: Bearer eb_..." \
 ```
 
 The answer contains the SSH address, port, password and a ready message for the customer
-(`text`, `text_fa`). Renew, change password, stop/start, resize, extra IPs and ports, and
-delete all work through the API too. Automatic sales stop when a plan no longer fits on the
+(`text`, `text_fa`). Renew, change password, stop/start, resize, extra IPs and ports, moving
+SSH to another port, and delete all work through the API too. Automatic sales stop when a plan no longer fits on the
 server (configurable limits, `409 server_full`). Full reference with PHP code: **[docs/API.md](docs/API.md)**.
 
 ## Command line

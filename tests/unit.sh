@@ -201,6 +201,9 @@ case "$1" in
   create) printf '%s\n' "$@" > "$(dirname "$0")/create-args"   # (the API passes a clean environment)
           [ "$2" = full ] && { echo "[x] server is full: RAM sale limit reached" >&2; exit 1; }
           exit 0 ;;
+  port) printf '%s\n' "$@" > "$(dirname "$0")/port-args"
+        [ "$2" = ssh ] && [ "$4" = 22 ] && { echo "[x] already used by this server (tcp 22)" >&2; exit 1; }
+        exit 0 ;;
   *) echo "[x] unsupported in the fake" >&2; exit 1 ;;
 esac
 EOF
@@ -249,6 +252,17 @@ for want in (["--plan", "small"], ["--password", 'a b"c'], ["--cpu", "0.25"], ["
         fails += 1
         print("FAIL: api create args miss %s: %s" % (want, args))
 check("server full", req("POST", "/machines", {"name": "full"}), 409, lambda d: d["code"] == "server_full")
+portargs = argfile.rsplit("/", 1)[0] + "/port-args"
+check("ssh port", req("POST", "/machines/alpha/ssh-port", {"port": 2298}), 200, lambda d: d["machine"]["name"] == "alpha")
+if open(portargs).read().split("\n")[:4] != ["port", "ssh", "alpha", "2298"]:
+    fails += 1
+    print("FAIL: api ssh-port args: %r" % open(portargs).read())
+check("ssh port auto", req("POST", "/machines/alpha/ssh-port", {}), 200)
+if open(portargs).read().split("\n")[:4] != ["port", "ssh", "alpha", "auto"]:
+    fails += 1
+    print("FAIL: api ssh-port auto args: %r" % open(portargs).read())
+check("ssh port taken", req("POST", "/machines/alpha/ssh-port", {"port": 22}), 409, lambda d: d["code"] == "conflict")
+check("ssh port read-only", req("POST", "/machines/alpha/ssh-port", {"port": 2298}, token="eb_read"), 403, lambda d: d["code"] == "read_only")
 check("bad value", req("POST", "/machines", {"cpu": {"x": 1}}), 400, lambda d: d["code"] == "bad_value")
 check("newline value", req("POST", "/machines", {"password": "a\nb"}), 400, lambda d: d["code"] == "bad_value")
 check("bad json", req("POST", "/machines", raw=b"{nope"), 400, lambda d: d["code"] == "bad_json")

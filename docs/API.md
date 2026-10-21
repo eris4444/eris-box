@@ -80,6 +80,7 @@ past the real free disk. When a plan does not fit any more, `GET /plans` shows
 | DELETE | `/machines/NAME/ips/5.6.7.8` | | `machine` |
 | POST | `/machines/NAME/ports` | `{"port":"25565","proto":"tcp"}` (`8080`, `"30000-30010"`, `"8080:80"`) | `machine` |
 | DELETE | `/machines/NAME/ports/25565` | | `machine` |
+| POST | `/machines/NAME/ssh-port` | `{"port":2298}` or `{}` (= the first free port) — moves SSH to a new port on the server's IP (since 1.3.0) | `machine` |
 | GET | `/jobs/JOB` | | state of an `async` create |
 
 **`POST /machines` fields** (all optional except that you give a plan or sizes):
